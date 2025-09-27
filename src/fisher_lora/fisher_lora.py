@@ -37,6 +37,10 @@ class FisherLoRAConfig:
             raise ValueError("damping must be positive")
         if self.min_factor_eig <= 0.0:
             raise ValueError("min_factor_eig must be positive")
+        if not isinstance(self.rank, int):
+            raise TypeError("rank must be an integer")
+        if self.rank < 0:
+            raise ValueError("rank must be non-negative")
 
 
 class FisherLoRALinear(nn.Module):
@@ -58,7 +62,7 @@ class FisherLoRALinear(nn.Module):
         self.config = config
         self.in_features = in_features
         self.out_features = out_features
-        self.rank = min(config.rank, in_features, out_features)
+        self.rank = int(min(config.rank, in_features, out_features))
         self.base = nn.Linear(in_features, out_features, bias=bias, device=device, dtype=dtype)
         if self.config.freeze_base:
             for param in self.base.parameters():
@@ -264,6 +268,14 @@ class FisherLoRALinear(nn.Module):
             f"in_features={self.in_features}, out_features={self.out_features}, rank={self.rank}, "
             f"ema_decay={self.config.ema_decay}, update_interval={self.config.update_interval}"
         )
+
+    ## TODO: CHECK THIS MAT_INV_SQRT FUNCTION
+    '''
+    def _matrix_inv_sqrt(matrix: Tensor, min_eig: float) -> Tensor:
+        eigvals, eigvecs = torch.linalg.eigh(matrix)
+        eigvals = eigvals.clamp_min(min_eig).rsqrt()
+        return (eigvecs * eigvals) @ eigvecs.T
+    '''
 
     @staticmethod
     def _matrix_inv_sqrt(matrix: Tensor, min_eig: float) -> Tensor:
