@@ -90,7 +90,9 @@ class FisherLoRALinear(nn.Module):
             init_scale = self.config.init_scale
             u = torch.randn(out_features, self.rank, device=device, dtype=dtype) * init_scale
             v = torch.randn(in_features, self.rank, device=device, dtype=dtype) * init_scale
-            s = torch.zeros(self.rank, self.rank, device=device, dtype=dtype)
+            #s = torch.zeros(self.rank, self.rank, device=device, dtype=dtype)
+            s = torch.eye(self.rank, device=device, dtype=dtype) * init_scale
+
             self.U = nn.Parameter(u, requires_grad=self.config.train_U)
             self.V = nn.Parameter(v, requires_grad=self.config.train_V)
             self.S = nn.Parameter(s, requires_grad=self.config.train_S)
