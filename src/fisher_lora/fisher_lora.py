@@ -4,9 +4,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Dict, Iterable, Optional
+import logging
 
 import torch
 from torch import Tensor, nn
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -243,6 +247,18 @@ class FisherLoRALinear(nn.Module):
             min_eig = self.config.min_factor_eig
             self.A_inv_sqrt.copy_(self._matrix_inv_sqrt(a, min_eig))
             self.B_inv_sqrt.copy_(self._matrix_inv_sqrt(b, min_eig))
+
+            if self.config.track_fisher and logger.isEnabledFor(logging.INFO):
+                whitened_a = self.A_inv_sqrt @ a @ self.A_inv_sqrt
+                whitened_b = self.B_inv_sqrt @ b @ self.B_inv_sqrt
+                e_a = (whitened_a - eye_in).norm() / max(1, self.in_features)
+                e_b = (whitened_b - eye_out).norm() / max(1, self.out_features)
+                logger.info(
+                    "Fisher-LoRA whitener refreshed (step=%d): eA=%.3e eB=%.3e",
+                    int(self.step_count.item()),
+                    float(e_a),
+                    float(e_b),
+                )
             if cache_bases and self.rank > 0:
                 self._cache_l_valid = False
                 self._cache_r_valid = False

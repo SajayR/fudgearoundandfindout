@@ -212,7 +212,14 @@ class DinoV2LoRATrainer:
             # Backward pass
             self.optimizer.zero_grad()
             loss.backward()
-            
+            # Calculate grad norm for logging
+            grad_norm = None
+            if self.config.training.gradient_clip_norm > 0:
+                parameters = [p for p in self.model.parameters() if p.grad is not None]
+                if parameters:
+                    grad_norm = torch.norm(
+                        torch.stack([p.grad.detach().norm(2) for p in parameters]), 2
+                    ).item()
             if self.config.training.gradient_clip_norm > 0:
                 torch.nn.utils.clip_grad_norm_(
                     self.model.parameters(), 
@@ -238,11 +245,13 @@ class DinoV2LoRATrainer:
             progress_bar.set_postfix({
                 'loss': f'{loss.item():.4f}',
                 'acc': f'{100.0 * correct_predictions / total_samples:.2f}%',
-                'lr': f'{current_lr:.2e}'
+                'lr': f'{current_lr:.2e}',
+                'grad_norm': f'{grad_norm:.2e}' if grad_norm is not None else 'N/A'
             })
             
             # Logging
             if self.global_step % self.config.training.logging_steps == 0:
+                
                 self._log_metrics({
                     'train/loss': loss.item(),
                     'train/learning_rate': current_lr,
