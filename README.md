@@ -22,7 +22,7 @@ In whitened coordinates, plain gradient descent = **natural gradient** (K-FAC) i
 
 **Why this beats Euclidean LoRA**
 
-* Rank-$r$ step aligns with **top singular modes of the whitened gradient** ⇒ best rank-$r$ *natural* step.
+* Rank-*r* step aligns with **top singular modes of the whitened gradient** ⇒ best rank-*r* *natural* step.
 * Approx. invariant to feature/output rescalings; usually allows larger, stabler steps.
 
 **Minimal training loop notes**
