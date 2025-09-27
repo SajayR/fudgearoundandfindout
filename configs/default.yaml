@@ -16,6 +16,7 @@ model:
 
 # LoRA configuration
 lora:
+  strategy: "fisher"
   r: 16                    # LoRA rank
   alpha: 32               # LoRA scaling parameter
   dropout: 0.1            # LoRA dropout
@@ -25,6 +26,25 @@ lora:
     - "value"
     - "dense"
   bias: "none"            # Bias type for LoRA
+
+fisher_lora:
+  ema_decay: 0.95
+  update_interval: 32
+  damping: 0.00001
+  min_factor_eig: 0.000001
+  freeze_base: true
+  train_U: true
+  train_V: true
+  init_scale: 0.001
+  factor_dtype: "float32"
+  track_fisher: true
+  target_modules:
+    - "backbone.encoder.layer.*.attention.attention.query"
+    - "backbone.encoder.layer.*.attention.attention.key"
+    - "backbone.encoder.layer.*.attention.attention.value"
+    - "backbone.encoder.layer.*.attention.output.dense"
+#    - "backbone.encoder.layer.*.mlp.fc1"
+#    - "backbone.encoder.layer.*.mlp.fc2"
 
 # Training configuration
 training:
@@ -52,7 +72,7 @@ scheduler:
 logging:
   use_wandb: true
   project_name: "dinov2-imagenet"
-  run_name: baseline_default          # Will be auto-generated if null
+  run_name: bfisher-lora          # Will be auto-generated if null
   log_dir: "./logs"
   
 # Checkpointing

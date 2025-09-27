@@ -128,7 +128,32 @@ class ConfigManager:
         
         if config.lora.alpha <= 0:
             raise ValueError("LoRA alpha must be positive")
-        
+
+        strategy = config.get("lora.strategy", "peft")
+        if strategy not in {"peft", "fisher"}:
+            raise ValueError(f"Unknown LoRA strategy: {strategy}")
+
+        if strategy == "fisher":
+            fisher_cfg = config.get("fisher_lora")
+            if fisher_cfg is None:
+                raise ValueError("fisher_lora configuration must be provided when using Fisher strategy")
+            required_fisher_fields = [
+                "ema_decay",
+                "update_interval",
+                "damping",
+                "min_factor_eig",
+                "freeze_base",
+                "train_U",
+                "train_V",
+                "init_scale",
+                "factor_dtype",
+                "track_fisher",
+                "target_modules",
+            ]
+            for field in required_fisher_fields:
+                if OmegaConf.select(fisher_cfg, field) is None:
+                    raise ValueError(f"Fisher-LoRA configuration missing field: {field}")
+
         # Validate training parameters (convert to float if needed)
         try:
             lr = float(config.training.learning_rate)

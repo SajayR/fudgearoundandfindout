@@ -3,6 +3,7 @@ Training script for DinoV2 LoRA fine-tuning on ImageNet.
 """
 
 import os
+import sys
 import argparse
 import logging
 import time
@@ -17,9 +18,19 @@ from torch.amp import autocast
 import wandb
 from tqdm import tqdm
 
+
+# Ensure ``src`` directory modules (e.g., fisher_lora) are importable when running as a script
+PROJECT_ROOT = Path(__file__).resolve().parent
+SRC_DIR = PROJECT_ROOT / "src"
+if SRC_DIR.exists():
+    src_path = str(SRC_DIR)
+    if src_path not in sys.path:
+        sys.path.insert(0, src_path)
+
 # Local imports
 from data.imagenet_dataset import create_imagenet_dataloaders
 from models.dinov2_lora import create_dinov2_lora_model, get_model_size_info
+from models.dinov2_fisher_lora import create_dinov2_fisher_lora_model
 from configs.config_manager import ConfigManager, ExperimentConfig
 from utils.metrics import accuracy, top_k_accuracy
 from utils.training_utils import (
@@ -111,27 +122,57 @@ class DinoV2LoRATrainer:
         logger.info("Setting up model...")
         
         # Create model
-        # Convert target_modules to regular list if it's a ListConfig
-        target_modules = self.config.lora.target_modules
-        if hasattr(target_modules, 'to_container'):
-            target_modules = target_modules.to_container()
-        elif not isinstance(target_modules, list):
-            target_modules = list(target_modules)
-            
-        self.model = create_dinov2_lora_model(
-            model_name=self.config.model.name,
-            num_classes=self.config.model.num_classes,
-            lora_r=self.config.lora.r,
-            lora_alpha=self.config.lora.alpha,
-            lora_dropout=self.config.lora.dropout,
-            target_modules=target_modules
-        )
+        strategy = getattr(self.config.lora, "strategy", "peft")
+        logger.info(f"Adapter strategy: {strategy}")
+
+        if strategy == "fisher":
+            fisher_cfg = self.config.fisher_lora
+            if hasattr(fisher_cfg, 'to_container'):
+                fisher_cfg = fisher_cfg.to_container()
+            else:
+                fisher_cfg = dict(fisher_cfg)
+
+            target_patterns = fisher_cfg.pop("target_modules", None)
+            if target_patterns is not None and hasattr(target_patterns, 'to_container'):
+                target_patterns = target_patterns.to_container()
+            elif target_patterns is not None and not isinstance(target_patterns, list):
+                target_patterns = list(target_patterns)
+
+            fisher_cfg.pop("rank", None)
+
+            self.model = create_dinov2_fisher_lora_model(
+                model_name=self.config.model.name,
+                num_classes=self.config.model.num_classes,
+                dropout=self.config.model.dropout,
+                fisher_rank=int(self.config.lora.r),
+                fisher_config=fisher_cfg,
+                target_patterns=target_patterns,
+            )
+        else:
+            # Convert target_modules to regular list if it's a ListConfig
+            target_modules = self.config.lora.target_modules
+            if hasattr(target_modules, 'to_container'):
+                target_modules = target_modules.to_container()
+            elif not isinstance(target_modules, list):
+                target_modules = list(target_modules)
+
+            self.model = create_dinov2_lora_model(
+                model_name=self.config.model.name,
+                num_classes=self.config.model.num_classes,
+                lora_r=self.config.lora.r,
+                lora_alpha=self.config.lora.alpha,
+                lora_dropout=self.config.lora.dropout,
+                target_modules=target_modules
+            )
         
         self.model = self.model.to(self.device)
         
         # Print model info
         model_info = get_model_size_info(self.model)
         logger.info(f"Model parameters: {model_info}")
+
+        if hasattr(self.model, "fisher_lora_modules"):
+            logger.info(f"Fisher-LoRA adapters active on {len(self.model.fisher_lora_modules)} layers")
         
         # Create optimizer
         self.optimizer = create_optimizer(self.model, self.config)
