@@ -11,7 +11,7 @@ In whitened coordinates, plain gradient descent = **natural gradient** (K-FAC) i
 **Core play**
 
 1. Define whitened weights $\tilde{W} := B^{1/2} W A^{1/2}$.
-2. Do a rank-$r$ LoRA update **in whitened space**: $\Delta \tilde{W} = U S V^\top$ (or just $U V^\top$).
+2. Do a rank-*r* LoRA update **in whitened space**: $\Delta \tilde{W} = U S V^\top$ (or just $U V^\top$).
 3. Map back:
    $$\boxed{\Delta W = B^{-1/2} \Delta \tilde{W} A^{-1/2}}$$
 
