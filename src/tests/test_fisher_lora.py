@@ -42,11 +42,10 @@ def test_attach_fisher_lora_wraps_all_linear_layers():
 
 def test_trainable_u_v_receive_gradients():
     torch.manual_seed(0)
-    config = FisherLoRAConfig(rank=2, train_U=True, train_V=True)#, train_S=True)
+    config = FisherLoRAConfig(rank=2, train_U=True, train_V=True)
     layer = FisherLoRALinear(4, 4, config=config)
     out = layer(torch.randn(2, 4))
     loss = out.sum()
     loss.backward()
     assert layer.U.grad is not None
     assert layer.V.grad is not None
-    #assert layer.S.grad is not None
