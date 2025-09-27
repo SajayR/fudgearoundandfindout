@@ -22,7 +22,7 @@ class FisherLoRAConfig:
     train_U: bool = True
     train_V: bool = True
     #train_S: bool = True
-    init_scale: float = 1.0e-7
+    init_scale: float = 1.0e-3
     factor_dtype: torch.dtype = torch.float32
     track_fisher: bool = True
 
@@ -97,8 +97,10 @@ class FisherLoRALinear(nn.Module):
 
         if self.rank > 0:
             init_scale = self.config.init_scale
-            u = torch.randn(out_features, self.rank, device=device, dtype=dtype) * init_scale
-            v = torch.randn(in_features, self.rank, device=device, dtype=dtype) * init_scale
+            #u = torch.randn(out_features, self.rank, device=device, dtype=dtype) * init_scale
+            #v = torch.randn(in_features, self.rank, device=device, dtype=dtype) * init_scale
+            u = torch.randn(out_features, self.rank, device=device, dtype=dtype) * (1.0 / (out_features ** 0.5))
+            v = torch.zeros(in_features, self.rank, device=device, dtype=dtype)
             self.U = nn.Parameter(u, requires_grad=self.config.train_U)
             self.V = nn.Parameter(v, requires_grad=self.config.train_V)
 
