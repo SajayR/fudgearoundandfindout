@@ -19,10 +19,10 @@ class FisherLoRAConfig:
     damping: float = 1.0e-5
     min_factor_eig: float = 1.0e-6
     freeze_base: bool = True
-    train_U: bool = False
-    train_V: bool = False
-    train_S: bool = True
-    init_scale: float = 1.0e-2
+    train_U: bool = True
+    train_V: bool = True
+    #train_S: bool = True
+    init_scale: float = 1.0e-7
     factor_dtype: torch.dtype = torch.float32
     track_fisher: bool = True
 
@@ -89,17 +89,22 @@ class FisherLoRALinear(nn.Module):
             "step_count",
             torch.zeros((), dtype=torch.long, device=device),
         )
+        # Defer whitening refresh until the next forward pass when set to True
+        self.register_buffer(
+            "refresh_pending",
+            torch.zeros((), dtype=torch.bool, device=device),
+        )
 
         if self.rank > 0:
             init_scale = self.config.init_scale
             u = torch.randn(out_features, self.rank, device=device, dtype=dtype) * init_scale
             v = torch.randn(in_features, self.rank, device=device, dtype=dtype) * init_scale
             #s = torch.zeros(self.rank, self.rank, device=device, dtype=dtype)
-            s = torch.eye(self.rank, device=device, dtype=dtype) * init_scale
+            # s = torch.eye(self.rank, device=device, dtype=dtype) * init_scale
 
             self.U = nn.Parameter(u, requires_grad=self.config.train_U)
             self.V = nn.Parameter(v, requires_grad=self.config.train_V)
-            self.S = nn.Parameter(s, requires_grad=self.config.train_S)
+            #self.S = nn.Parameter(s, requires_grad=self.config.train_S)
             self.register_buffer(
                 "L0_cached",
                 torch.zeros(out_features, self.rank, device=device, dtype=dtype),
@@ -113,7 +118,7 @@ class FisherLoRALinear(nn.Module):
         else:
             self.register_parameter("U", None)
             self.register_parameter("V", None)
-            self.register_parameter("S", None)
+            #self.register_parameter("S", None)
             self.register_buffer("L0_cached", torch.zeros(0, 0))
             self.register_buffer("R0_cached", torch.zeros(0, 0))
             self._cache_l_valid = False
@@ -149,10 +154,18 @@ class FisherLoRALinear(nn.Module):
         if self.rank == 0:
             return output
 
+        # If whitening refresh is pending, perform it now before using the adapters
+        if self.refresh_pending.item():
+            self._refresh_whiteners(cache_bases=True)
+            self.refresh_pending.zero_()
+
         L, R = self._skinny_bases()
-        right = torch.matmul(self.S, R.T)
+        #right = torch.matmul(self.S, R.T)
+        #input_2d = input.reshape(-1, self.in_features)
+        #proj = torch.matmul(input_2d, right.T)
+        #adapter_2d = torch.matmul(proj, L.T)
         input_2d = input.reshape(-1, self.in_features)
-        proj = torch.matmul(input_2d, right.T)
+        proj = torch.matmul(input_2d, R)
         adapter_2d = torch.matmul(proj, L.T)
         adapter = adapter_2d.reshape(*output.shape)
         result = output + adapter
@@ -163,6 +176,8 @@ class FisherLoRALinear(nn.Module):
 
     def _register_fisher_hooks(self, input: Tensor, output: Tensor) -> None:
         activations = input.detach()
+        if not output.requires_grad:
+            assert False, "output must require grad"
 
         def _capture_grad(grad_output: Tensor) -> Tensor:
             self._update_fisher_stats(activations, grad_output.detach())
@@ -188,7 +203,8 @@ class FisherLoRALinear(nn.Module):
             self.B_ema.mul_(decay).add_(g_factor, alpha=1.0 - decay)
             self.step_count.add_(1)
             if int(self.step_count.item()) % self.config.update_interval == 0:
-                self._refresh_whiteners(cache_bases=True)
+                # Defer refresh to next forward pass
+                self.refresh_pending.fill_(True)
 
     def _skinny_bases(self) -> tuple[Tensor, Tensor]:
         if self.rank == 0:
@@ -196,26 +212,30 @@ class FisherLoRALinear(nn.Module):
         factor_dtype = self.config.factor_dtype
         adapter_dtype = self.base.weight.dtype
         if self.config.train_U:
-            B = self.B_inv_sqrt.to(self.U.dtype)
-            L = torch.matmul(B, self.U)
-            if L.dtype != adapter_dtype:
-                L = L.to(adapter_dtype)
+            #B = self.B_inv_sqrt.to(self.U.dtype)
+            #L = torch.matmul(B, self.U)
+            #if L.dtype != adapter_dtype:
+            #    L = L.to(adapter_dtype)
+            L = (self.B_inv_sqrt @ self.U.to(factor_dtype)).to(adapter_dtype)
         else:
             if not self._cache_l_valid:
                 with torch.no_grad():
-                    tmp = torch.matmul(self.B_inv_sqrt, self.U.detach().to(factor_dtype))
+                    #tmp = torch.matmul(self.B_inv_sqrt, self.U.detach().to(factor_dtype))
+                    tmp = self.B_inv_sqrt @ self.U.detach().to(factor_dtype)
                     self.L0_cached.copy_(tmp.to(adapter_dtype))
                     self._cache_l_valid = True
             L = self.L0_cached
         if self.config.train_V:
-            A = self.A_inv_sqrt.to(self.V.dtype)
-            R = torch.matmul(A, self.V)
-            if R.dtype != adapter_dtype:
-                R = R.to(adapter_dtype)
+            #A = self.A_inv_sqrt.to(self.V.dtype)
+            #R = torch.matmul(A, self.V)
+            #if R.dtype != adapter_dtype:
+            #    R = R.to(adapter_dtype)
+            R = (self.A_inv_sqrt @ self.V.to(factor_dtype)).to(adapter_dtype)
         else:
             if not self._cache_r_valid:
                 with torch.no_grad():
-                    tmp = torch.matmul(self.A_inv_sqrt, self.V.detach().to(factor_dtype))
+                    #tmp = torch.matmul(self.A_inv_sqrt, self.V.detach().to(factor_dtype))
+                    tmp = self.A_inv_sqrt @ self.V.detach().to(factor_dtype)
                     self.R0_cached.copy_(tmp.to(adapter_dtype))
                     self._cache_r_valid = True
             R = self.R0_cached
@@ -245,6 +265,8 @@ class FisherLoRALinear(nn.Module):
     def refresh(self) -> None:
         """Force-refresh whitening factors from the current EMAs."""
         self._refresh_whiteners(cache_bases=True)
+        # Clear any pending refresh since we just performed it
+        self.refresh_pending.zero_()
 
     def reset_fisher(self) -> None:
         """Reset Fisher statistics to their initial isotropic estimates."""
@@ -262,27 +284,29 @@ class FisherLoRALinear(nn.Module):
             self.A_ema.copy_(eye_in)
             self.B_ema.copy_(eye_out)
             self._refresh_whiteners(cache_bases=True)
+            # Clear any pending refresh since we just performed it
+            self.refresh_pending.zero_()
 
     def extra_repr(self) -> str:
         return (
             f"in_features={self.in_features}, out_features={self.out_features}, rank={self.rank}, "
             f"ema_decay={self.config.ema_decay}, update_interval={self.config.update_interval}"
         )
-
-    ## TODO: CHECK THIS MAT_INV_SQRT FUNCTION
-    '''
+    
+    @staticmethod
     def _matrix_inv_sqrt(matrix: Tensor, min_eig: float) -> Tensor:
         eigvals, eigvecs = torch.linalg.eigh(matrix)
         eigvals = eigvals.clamp_min(min_eig).rsqrt()
         return (eigvecs * eigvals) @ eigvecs.T
+    
     '''
-
     @staticmethod
     def _matrix_inv_sqrt(matrix: Tensor, min_eig: float) -> Tensor:
         eigvals, eigvecs = torch.linalg.eigh(matrix)
         eigvals = torch.clamp(eigvals, min=min_eig)
         inv_sqrt = eigvecs @ torch.diag(eigvals.rsqrt()) @ eigvecs.T
         return inv_sqrt
+    '''
 
 
 def attach_fisher_lora(
