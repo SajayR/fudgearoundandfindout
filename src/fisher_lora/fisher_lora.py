@@ -26,8 +26,8 @@ class FisherLoRAConfig:
     train_U: bool = True
     train_V: bool = True
 
-    use_S: bool = False                 # enable diagonal S
-    train_S: bool = False               # whether S is trainable
+    use_S: bool = True                 # enable diagonal S
+    train_S: bool = True               # whether S is trainable
     s_init_value: float = 0.0          # usually 0.0 for zero adapter at start
     init_scale: float = 1.0e-3
     factor_dtype: torch.dtype = torch.float32
@@ -119,6 +119,7 @@ class FisherLoRALinear(nn.Module):
                 u = torch.randn(out_features, self.rank, device=device, dtype=dtype) * (1.0 / (out_features ** 0.5))
                 v = torch.zeros(in_features,  self.rank, device=device, dtype=dtype)
                 s = None
+                
             self.U = nn.Parameter(u, requires_grad=self.config.train_U)
             self.V = nn.Parameter(v, requires_grad=self.config.train_V)
 
@@ -415,50 +416,25 @@ class FisherLoRALinear(nn.Module):
         eye_in: Tensor,
         eye_out: Tensor,
     ) -> tuple[Tensor, Tensor]:
-        whitened_a = self.A_inv_sqrt @ a_matrix @ self.A_inv_sqrt
-        whitened_b = self.B_inv_sqrt @ b_matrix @ self.B_inv_sqrt
-        e_a = (whitened_a - eye_in).norm() / max(1, self.in_features)
-        e_b = (whitened_b - eye_out).norm() / max(1, self.out_features)
+        #whitened_a = self.A_inv_sqrt @ a_matrix @ self.A_inv_sqrt
+        #whitened_b = self.B_inv_sqrt @ b_matrix @ self.B_inv_sqrt
+        #e_a = (whitened_a - eye_in).norm() / max(1, self.in_features)
+        #e_b = (whitened_b - eye_out).norm() / max(1, self.out_features)
+        #e_a = (whitened_a - eye_in).norm() / (self.in_features ** 0.5)
+        #e_b = (whitened_b - eye_out).norm() / (self.out_features ** 0.5)
+        diff_a = self.A_inv_sqrt @ a_matrix @ self.A_inv_sqrt - eye_in
+        diff_b = self.B_inv_sqrt @ b_matrix @ self.B_inv_sqrt - eye_out
+
+        e_a = torch.linalg.norm(diff_a, ord='fro') / (self.in_features ** 0.5)
+        e_b = torch.linalg.norm(diff_b, ord='fro') / (self.out_features ** 0.5)
+
         return e_a, e_b
 
     def _log_whiteness_metrics(self, e_a: float, e_b: float, *, phase: str) -> None:
-        """Optionally log whiteness metrics to wandb."""
-
-        try:
-            import wandb  # type: ignore
-        except ImportError:
-            return
-
-        run = getattr(wandb, "run", None)
-        if run is None:
-            return
-
-        prefix = self._fisher_lora_name or "fisher_lora"
-        metrics = {
-            f"fisher/{prefix}/whiteness_{phase}_eA": e_a,
-            f"fisher/{prefix}/whiteness_{phase}_eB": e_b,
-        }
-        step = int(self.step_count.item()) if hasattr(self, "step_count") else None
-        wandb.log(metrics, step=step)
-
+        pass
     def _log_adapter_jump(self, jump: float) -> None:
-        """Optionally log adapter jump metrics to wandb."""
+        pass
 
-        try:
-            import wandb  # type: ignore
-        except ImportError:
-            return
-
-        run = getattr(wandb, "run", None)
-        if run is None:
-            return
-
-        prefix = self._fisher_lora_name or "fisher_lora"
-        metrics = {
-            f"fisher/{prefix}/adapter_jump": jump,
-        }
-        step = int(self.step_count.item()) if hasattr(self, "step_count") else None
-        wandb.log(metrics, step=step)
 
 
 def attach_fisher_lora(

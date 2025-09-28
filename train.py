@@ -228,9 +228,9 @@ class DinoV2LoRATrainer:
             
             self._reset_fisher_optimizer_state_if_needed()
             self.optimizer.step()
-            if self.global_step % 20 == 0:
-                for m in self.model.modules():
-                    if isinstance(m, FisherLoRALinear): m.balance_columns()
+            #if self.global_step % 20 == 0:
+                #for m in self.model.modules():
+                    #if isinstance(m, FisherLoRALinear): m.balance_columns()
             
             if self.scheduler is not None:
                 self.scheduler.step()
