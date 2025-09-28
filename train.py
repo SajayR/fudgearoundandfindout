@@ -226,6 +226,7 @@ class DinoV2LoRATrainer:
                     self.config.training.gradient_clip_norm
                 )
             
+            self._reset_fisher_optimizer_state_if_needed()
             self.optimizer.step()
             
             if self.scheduler is not None:
@@ -325,7 +326,29 @@ class DinoV2LoRATrainer:
         """Log metrics to wandb."""
         if self.config.logging.use_wandb:
             wandb.log(metrics, step=self.global_step)
-    
+
+    def _reset_fisher_optimizer_state_if_needed(self) -> None:
+        if not hasattr(self.model, "fisher_lora_modules"):
+            return
+        if self.optimizer is None:
+            return
+        for module in self.model.fisher_lora_modules.values():
+            if not getattr(module, "just_reparam", False):
+                continue
+            for param in (module.U, module.V):
+                if param is None:
+                    continue
+                state = self.optimizer.state.get(param)
+                if not state:
+                    continue
+                exp_avg = state.get("exp_avg")
+                if isinstance(exp_avg, torch.Tensor):
+                    exp_avg.zero_()
+                exp_avg_sq = state.get("exp_avg_sq")
+                if isinstance(exp_avg_sq, torch.Tensor):
+                    exp_avg_sq.zero_()
+            module.just_reparam = False
+
     def save_checkpoint(self, metrics: Dict[str, float], is_best: bool = False):
         """Save model checkpoint."""
         checkpoint = {

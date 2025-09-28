@@ -38,6 +38,7 @@ fisher_lora:
   init_scale: 0.001
   factor_dtype: "float32"
   track_fisher: true
+  whiteness_log_interval: null  # Set to 1 for per-step pre-refresh logging
   target_modules:
     - "backbone.encoder.layer.*.attention.attention.query"
     - "backbone.encoder.layer.*.attention.attention.key"

@@ -26,7 +26,8 @@ def setup_logging(log_dir: str, level: int = logging.INFO):
         handlers=[
             logging.FileHandler(log_dir / 'training.log'),
             logging.StreamHandler()
-        ]
+        ],
+        force=True,
     )
 
 

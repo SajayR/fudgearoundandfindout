@@ -29,6 +29,7 @@ class FisherLoRAConfig:
     init_scale: float = 1.0e-3
     factor_dtype: torch.dtype = torch.float32
     track_fisher: bool = True
+    whiteness_log_interval: Optional[int] = None
 
     def __post_init__(self) -> None:
         if not (0.0 <= self.rank):
@@ -45,6 +46,8 @@ class FisherLoRAConfig:
             raise TypeError("rank must be an integer")
         if self.rank < 0:
             raise ValueError("rank must be non-negative")
+        if self.whiteness_log_interval is not None and self.whiteness_log_interval <= 0:
+            raise ValueError("whiteness_log_interval must be positive when provided")
 
 
 class FisherLoRALinear(nn.Module):
@@ -126,7 +129,11 @@ class FisherLoRALinear(nn.Module):
             self._cache_l_valid = False
             self._cache_r_valid = False
 
+        # Set by attach_fisher_lora to identify metrics in logs
+        self._fisher_lora_name: Optional[str] = None
+        self.just_reparam = False
         self._refresh_whiteners(cache_bases=True)
+        self.just_reparam = False
 
     @classmethod
     def from_linear(
@@ -200,6 +207,32 @@ class FisherLoRALinear(nn.Module):
             self.A_ema.mul_(decay).add_(a_factor, alpha=1.0 - decay)
             self.B_ema.mul_(decay).add_(g_factor, alpha=1.0 - decay)
             self.step_count.add_(1)
+
+            if self.config.track_fisher:
+                log_interval = self.config.whiteness_log_interval or self.config.update_interval
+                step = int(self.step_count.item())
+                if step == 1 or (log_interval and step % log_interval == 0):
+                    eye_in = torch.eye(
+                        self.in_features,
+                        dtype=factor_dtype,
+                        device=self.A_ema.device,
+                    )
+                    eye_out = torch.eye(
+                        self.out_features,
+                        dtype=factor_dtype,
+                        device=self.B_ema.device,
+                    )
+                    a_damped = self.A_ema + self.config.damping * eye_in
+                    b_damped = self.B_ema + self.config.damping * eye_out
+                    e_a, e_b = self._compute_whiteness_errors(a_damped, b_damped, eye_in, eye_out)
+                    if logger.isEnabledFor(logging.INFO):
+                        logger.info(
+                            "Fisher-LoRA whiteness (pre-refresh, step=%d): eA=%.3e eB=%.3e",
+                            step,
+                            float(e_a),
+                            float(e_b),
+                        )
+                    self._log_whiteness_metrics(float(e_a), float(e_b), phase="pre_refresh")
             if int(self.step_count.item()) % self.config.update_interval == 0:
                 # Defer refresh to next forward pass
                 self.refresh_pending.fill_(True)
@@ -232,6 +265,23 @@ class FisherLoRALinear(nn.Module):
 
     def _refresh_whiteners(self, *, cache_bases: bool) -> None:
         with torch.no_grad():
+            adapter_jump = None
+            U_t: Optional[Tensor] = None
+            V_t: Optional[Tensor] = None
+            delta_old: Optional[Tensor] = None
+            B_inv_old: Optional[Tensor] = None
+            A_inv_old: Optional[Tensor] = None
+            if self.rank > 0:
+                factor_dtype = self.config.factor_dtype
+                B_inv_old = self.B_inv_sqrt.clone()
+                A_inv_old = self.A_inv_sqrt.clone()
+                U_t = self.U.detach().to(factor_dtype)
+                V_t = self.V.detach().to(factor_dtype)
+                if self.config.track_fisher:
+                    L_old = B_inv_old @ U_t
+                    R_old = A_inv_old @ V_t
+                    delta_old = L_old @ R_old.T
+
             eye_in = torch.eye(
                 self.in_features,
                 dtype=self.config.factor_dtype,
@@ -248,17 +298,42 @@ class FisherLoRALinear(nn.Module):
             self.A_inv_sqrt.copy_(self._matrix_inv_sqrt(a, min_eig))
             self.B_inv_sqrt.copy_(self._matrix_inv_sqrt(b, min_eig))
 
-            if self.config.track_fisher and logger.isEnabledFor(logging.INFO):
-                whitened_a = self.A_inv_sqrt @ a @ self.A_inv_sqrt
-                whitened_b = self.B_inv_sqrt @ b @ self.B_inv_sqrt
-                e_a = (whitened_a - eye_in).norm() / max(1, self.in_features)
-                e_b = (whitened_b - eye_out).norm() / max(1, self.out_features)
-                logger.info(
-                    "Fisher-LoRA whitener refreshed (step=%d): eA=%.3e eB=%.3e",
-                    int(self.step_count.item()),
-                    float(e_a),
-                    float(e_b),
-                )
+            if self.config.track_fisher:
+                if self.rank > 0 and U_t is not None and V_t is not None and delta_old is not None:
+                    L_new = self.B_inv_sqrt @ U_t
+                    R_new = self.A_inv_sqrt @ V_t
+                    delta_new = L_new @ R_new.T
+                    diff = (delta_new - delta_old).norm()
+                    denom = delta_old.norm() + 1.0e-12
+                    adapter_jump = float((diff / denom).item())
+                e_a, e_b = self._compute_whiteness_errors(a, b, eye_in, eye_out)
+                if logger.isEnabledFor(logging.INFO):
+                    if adapter_jump is not None:
+                        logger.info(
+                            "Fisher-LoRA whitener refreshed (step=%d): eA=%.3e eB=%.3e jump=%.3e",
+                            int(self.step_count.item()),
+                            float(e_a),
+                            float(e_b),
+                            adapter_jump,
+                        )
+                    else:
+                        logger.info(
+                            "Fisher-LoRA whitener refreshed (step=%d): eA=%.3e eB=%.3e",
+                            int(self.step_count.item()),
+                            float(e_a),
+                            float(e_b),
+                        )
+                self._log_whiteness_metrics(float(e_a), float(e_b), phase="post_refresh")
+                if adapter_jump is not None:
+                    self._log_adapter_jump(adapter_jump)
+            if self.rank > 0 and B_inv_old is not None and A_inv_old is not None and U_t is not None and V_t is not None:
+                S_B = torch.linalg.solve(self.B_inv_sqrt, B_inv_old)
+                S_A = torch.linalg.solve(self.A_inv_sqrt, A_inv_old)
+                new_U = S_B @ U_t
+                new_V = S_A @ V_t
+                self.U.copy_(new_U.to(self.U.dtype))
+                self.V.copy_(new_V.to(self.V.dtype))
+                self.just_reparam = True
             if cache_bases and self.rank > 0:
                 self._cache_l_valid = False
                 self._cache_r_valid = False
@@ -299,7 +374,59 @@ class FisherLoRALinear(nn.Module):
         eigvals, eigvecs = torch.linalg.eigh(matrix)
         eigvals = eigvals.clamp_min(min_eig).rsqrt()
         return (eigvecs * eigvals) @ eigvecs.T
-    
+
+    def _compute_whiteness_errors(
+        self,
+        a_matrix: Tensor,
+        b_matrix: Tensor,
+        eye_in: Tensor,
+        eye_out: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        whitened_a = self.A_inv_sqrt @ a_matrix @ self.A_inv_sqrt
+        whitened_b = self.B_inv_sqrt @ b_matrix @ self.B_inv_sqrt
+        e_a = (whitened_a - eye_in).norm() / max(1, self.in_features)
+        e_b = (whitened_b - eye_out).norm() / max(1, self.out_features)
+        return e_a, e_b
+
+    def _log_whiteness_metrics(self, e_a: float, e_b: float, *, phase: str) -> None:
+        """Optionally log whiteness metrics to wandb."""
+
+        try:
+            import wandb  # type: ignore
+        except ImportError:
+            return
+
+        run = getattr(wandb, "run", None)
+        if run is None:
+            return
+
+        prefix = self._fisher_lora_name or "fisher_lora"
+        metrics = {
+            f"fisher/{prefix}/whiteness_{phase}_eA": e_a,
+            f"fisher/{prefix}/whiteness_{phase}_eB": e_b,
+        }
+        step = int(self.step_count.item()) if hasattr(self, "step_count") else None
+        wandb.log(metrics, step=step)
+
+    def _log_adapter_jump(self, jump: float) -> None:
+        """Optionally log adapter jump metrics to wandb."""
+
+        try:
+            import wandb  # type: ignore
+        except ImportError:
+            return
+
+        run = getattr(wandb, "run", None)
+        if run is None:
+            return
+
+        prefix = self._fisher_lora_name or "fisher_lora"
+        metrics = {
+            f"fisher/{prefix}/adapter_jump": jump,
+        }
+        step = int(self.step_count.item()) if hasattr(self, "step_count") else None
+        wandb.log(metrics, step=step)
+
 
 def attach_fisher_lora(
     module: nn.Module,
@@ -334,10 +461,13 @@ def attach_fisher_lora(
         for name, child in list(current.named_children()):
             full_name = f"{prefix}{name}" if prefix else name
             if isinstance(child, FisherLoRALinear):
+                if not getattr(child, "_fisher_lora_name", None):
+                    child._fisher_lora_name = full_name
                 replaced[full_name] = child
                 continue
             if isinstance(child, nn.Linear) and _should_replace(full_name):
                 fisher = FisherLoRALinear.from_linear(child, config=config)
+                fisher._fisher_lora_name = full_name
                 current.add_module(name, fisher)
                 replaced[full_name] = fisher
             else:
