@@ -25,7 +25,10 @@ class FisherLoRAConfig:
     freeze_base: bool = True
     train_U: bool = True
     train_V: bool = True
-    #train_S: bool = True
+
+    use_S: bool = True                 # enable diagonal S
+    train_S: bool = True               # whether S is trainable
+    s_init_value: float = 0.0          # usually 0.0 for zero adapter at start
     init_scale: float = 1.0e-3
     factor_dtype: torch.dtype = torch.float32
     track_fisher: bool = True
@@ -106,10 +109,23 @@ class FisherLoRALinear(nn.Module):
             init_scale = self.config.init_scale
             #u = torch.randn(out_features, self.rank, device=device, dtype=dtype) * init_scale
             #v = torch.randn(in_features, self.rank, device=device, dtype=dtype) * init_scale
-            u = torch.randn(out_features, self.rank, device=device, dtype=dtype) * (1.0 / (out_features ** 0.5))
-            v = torch.zeros(in_features, self.rank, device=device, dtype=dtype)
+            if self.config.use_S:
+                # Small-random U,V; S = 0 → ΔW starts at 0, grads flow to S immediately
+                u = torch.randn(out_features, self.rank, device=device, dtype=dtype) * (1.0 / (out_features ** 0.5))
+                v = torch.randn(in_features,  self.rank, device=device, dtype=dtype) * (1.0 / (in_features  ** 0.5))
+                s = torch.full((self.rank,), fill_value=self.config.s_init_value, device=device, dtype=dtype)
+            else:
+                # UV-only: LoRA-style safe init (U random, V zero) to keep ΔW=0
+                u = torch.randn(out_features, self.rank, device=device, dtype=dtype) * (1.0 / (out_features ** 0.5))
+                v = torch.zeros(in_features,  self.rank, device=device, dtype=dtype)
+                s = None
             self.U = nn.Parameter(u, requires_grad=self.config.train_U)
             self.V = nn.Parameter(v, requires_grad=self.config.train_V)
+
+            if self.config.use_S:
+                self.S = nn.Parameter(s, requires_grad=self.config.train_S)
+            else:
+                self.register_parameter("S", None)
 
             self.register_buffer(
                 "L0_cached",
@@ -124,6 +140,7 @@ class FisherLoRALinear(nn.Module):
         else:
             self.register_parameter("U", None)
             self.register_parameter("V", None)
+            self.register_parameter("S", None)
             self.register_buffer("L0_cached", torch.zeros(0, 0))
             self.register_buffer("R0_cached", torch.zeros(0, 0))
             self._cache_l_valid = False
@@ -170,10 +187,16 @@ class FisherLoRALinear(nn.Module):
 
         L, R = self._skinny_bases()
         input_2d = input.reshape(-1, self.in_features)
-        proj = torch.matmul(input_2d, R)
-        adapter_2d = torch.matmul(proj, L.T)
+        proj = torch.matmul(input_2d, R)  # (N, r)
+
+        # NEW: scale per mode with diagonal S
+        if self.config.use_S:
+            proj = proj * self.S.to(proj.dtype)  # broadcast over batch dim
+
+        adapter_2d = torch.matmul(proj, L.T)     # (N, dout)
         adapter = adapter_2d.reshape(*output.shape)
         result = output + adapter
+
 
         if self.training and self.config.track_fisher:
             self._register_fisher_hooks(input, result)

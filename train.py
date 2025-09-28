@@ -373,7 +373,7 @@ class DinoV2LoRATrainer:
         
         # Save LoRA weights separately
         lora_path = self.checkpoint_dir / f"lora_weights_epoch_{self.current_epoch}"
-        self.model.save_lora_weights(lora_path)
+        #self.model.save_lora_weights(lora_path) # TODO: add this back in with fisher support
         
         logger.info(f"Saved checkpoint: {checkpoint_path}")
     
