@@ -26,8 +26,8 @@ class FisherLoRAConfig:
     train_U: bool = True
     train_V: bool = True
 
-    use_S: bool = True                 # enable diagonal S
-    train_S: bool = True               # whether S is trainable
+    use_S: bool = False                 # enable diagonal S
+    train_S: bool = False               # whether S is trainable
     s_init_value: float = 0.0          # usually 0.0 for zero adapter at start
     init_scale: float = 1.0e-3
     factor_dtype: torch.dtype = torch.float32
@@ -385,6 +385,16 @@ class FisherLoRALinear(nn.Module):
             self._refresh_whiteners(cache_bases=True)
             # Clear any pending refresh since we just performed it
             self.refresh_pending.zero_()
+
+    @torch.no_grad()
+    def balance_columns(self, eps: float = 1e-12) -> None:
+        if self.rank == 0: return
+        u = self.U.norm(dim=0).clamp_min(eps)
+        v = self.V.norm(dim=0).clamp_min(eps)
+        s = (u / v).sqrt()
+        self.U.div_(s)     # U_i <- U_i / s_i
+        self.V.mul_(s)     # V_i <- V_i * s_i
+
 
     def extra_repr(self) -> str:
         return (

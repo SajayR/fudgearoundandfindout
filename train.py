@@ -17,7 +17,7 @@ from torch.utils.data import DataLoader
 from torch.amp import autocast
 import wandb
 from tqdm import tqdm
-
+from src.fisher_lora import FisherLoRALinear
 
 # Ensure ``src`` directory modules (e.g., fisher_lora) are importable when running as a script
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -228,6 +228,9 @@ class DinoV2LoRATrainer:
             
             self._reset_fisher_optimizer_state_if_needed()
             self.optimizer.step()
+            if self.global_step % 20 == 0:
+                for m in self.model.modules():
+                    if isinstance(m, FisherLoRALinear): m.balance_columns()
             
             if self.scheduler is not None:
                 self.scheduler.step()
