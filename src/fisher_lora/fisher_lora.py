@@ -21,9 +21,9 @@ class FisherLoRAConfig:
     ema_decay: float = 0.99
     update_interval: int = 32
     ema_decay_start: Optional[float] = 0.70
-    ema_decay_anneal_steps: Optional[int] = 500
+    ema_decay_anneal_steps: Optional[int] = 1000
     update_interval_start: Optional[int] = 4
-    update_interval_anneal_steps: Optional[int] = 500
+    update_interval_anneal_steps: Optional[int] = 2500
     damping: float = 1.0e-5
     min_factor_eig: float = 1.0e-6
     freeze_base: bool = True
@@ -324,7 +324,9 @@ class FisherLoRALinear(nn.Module):
                     self._log_whiteness_metrics(float(e_a), float(e_b), phase="pre_refresh")
             if step % current_interval == 0:
                 # Defer refresh to next forward pass
-                self.refresh_pending.fill_(True)
+                should_refresh = (float(e_a) > 0.25) or (float(e_b) > 0.02)  # RMS thresholds
+                if should_refresh:
+                    self.refresh_pending.fill_(True)
 
     def _skinny_bases(self) -> tuple[Tensor, Tensor]:
         if self.rank == 0:
@@ -369,7 +371,8 @@ class FisherLoRALinear(nn.Module):
                 if self.config.track_fisher:
                     L_old = B_inv_old @ U_t
                     R_old = A_inv_old @ V_t
-                    delta_old = L_old @ R_old.T
+                    #delta_old = L_old @ R_old.T
+                    delta_old = (L_old * self.S.view(1,-1)) @ R_old.T 
 
             eye_in = torch.eye(
                 self.in_features,
@@ -391,10 +394,14 @@ class FisherLoRALinear(nn.Module):
                 if self.rank > 0 and U_t is not None and V_t is not None and delta_old is not None:
                     L_new = self.B_inv_sqrt @ U_t
                     R_new = self.A_inv_sqrt @ V_t
-                    delta_new = L_new @ R_new.T
+                    #delta_new = L_new @ R_new.T
+                    delta_new = (L_new * self.S.view(1,-1)) @ R_new.T
                     diff = (delta_new - delta_old).norm()
                     denom = delta_old.norm() + 1.0e-12
                     adapter_jump = float((diff / denom).item())
+                    self.just_reparam = adapter_jump is not None and adapter_jump > 1e-6
+                    self._last_adapter_jump = adapter_jump or 0.0
+
                 e_a, e_b = self._compute_whiteness_errors(a, b, eye_in, eye_out)
                 if logger.isEnabledFor(logging.INFO):
                     if adapter_jump is not None:
@@ -422,7 +429,7 @@ class FisherLoRALinear(nn.Module):
                 new_V = S_A @ V_t
                 self.U.copy_(new_U.to(self.U.dtype))
                 self.V.copy_(new_V.to(self.V.dtype))
-                self.just_reparam = True
+                
             if cache_bases and self.rank > 0:
                 self._cache_l_valid = False
                 self._cache_r_valid = False
@@ -481,12 +488,7 @@ class FisherLoRALinear(nn.Module):
         eye_in: Tensor,
         eye_out: Tensor,
     ) -> tuple[Tensor, Tensor]:
-        #whitened_a = self.A_inv_sqrt @ a_matrix @ self.A_inv_sqrt
-        #whitened_b = self.B_inv_sqrt @ b_matrix @ self.B_inv_sqrt
-        #e_a = (whitened_a - eye_in).norm() / max(1, self.in_features)
-        #e_b = (whitened_b - eye_out).norm() / max(1, self.out_features)
-        #e_a = (whitened_a - eye_in).norm() / (self.in_features ** 0.5)
-        #e_b = (whitened_b - eye_out).norm() / (self.out_features ** 0.5)
+
         diff_a = self.A_inv_sqrt @ a_matrix @ self.A_inv_sqrt - eye_in
         diff_b = self.B_inv_sqrt @ b_matrix @ self.B_inv_sqrt - eye_out
 

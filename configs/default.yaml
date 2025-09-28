@@ -4,7 +4,7 @@
 data:
   dataset_path: "/speedy/ImageNet"
   image_size: 224
-  batch_size: 128 #256 for bf16, 128 for fp16
+  batch_size: 256 #256 for bf16, 128 for fp16
   num_workers: 8
   pin_memory: true
   
@@ -29,7 +29,7 @@ lora:
 
 fisher_lora:
   ema_decay: 0.99
-  update_interval: 32
+  update_interval: 256
   damping: 0.0001
   min_factor_eig: 0.00001 #doesnt affect training, nan safety shit
   freeze_base: true
@@ -58,9 +58,11 @@ training:
   
 # Optimizer configuration
 optimizer:
-  type: "adamw"           # Options: adamw, adam, sgd
+  type: "sgd"           # Options: adamw, adam, sgd
   betas: [0.9, 0.999]
   eps: 0.00000001
+  momentum: 0.9
+  nesterov: true
 
 # Scheduler configuration  
 scheduler:
@@ -71,7 +73,7 @@ scheduler:
 logging:
   use_wandb: true
   project_name: "dinov2-imagenet"
-  run_name: bfisher-lora-s-anneal          # Will be auto-generated if null
+  run_name: bfisher-lora-s-anneal-s-oneinit-nooptimresets-sgd          # Will be auto-generated if null
   log_dir: "./logs"
   
 # Checkpointing

@@ -51,7 +51,7 @@ def create_optimizer(model: torch.nn.Module, config) -> torch.optim.Optimizer:
         optimizer = optim.AdamW(
             trainable_params,
             lr=config.training.learning_rate,
-            weight_decay=config.training.weight_decay,
+            weight_decay=0.0, #config.training.weight_decay, #hard locked since weight decay is not invariant under reparam
             betas=config.optimizer.betas,
             eps=config.optimizer.eps
         )
@@ -59,16 +59,19 @@ def create_optimizer(model: torch.nn.Module, config) -> torch.optim.Optimizer:
         optimizer = optim.Adam(
             trainable_params,
             lr=config.training.learning_rate,
-            weight_decay=config.training.weight_decay,
+            weight_decay=0.0, #config.training.weight_decay, #hard locked since weight decay is not invariant under reparam
             betas=config.optimizer.betas,
             eps=config.optimizer.eps
         )
     elif config.optimizer.type.lower() == "sgd":
+        momentum = config.get("optimizer.momentum", 0.0)
+        nesterov = config.get("optimizer.nesterov", False)
         optimizer = optim.SGD(
             trainable_params,
             lr=config.training.learning_rate,
-            weight_decay=config.training.weight_decay,
-            momentum=0.9
+            weight_decay=0.0, #config.training.weight_decay, #hard locked since weight decay is not invariant under reparam
+            momentum=momentum,
+            nesterov=nesterov
         )
     else:
         raise ValueError(f"Unsupported optimizer type: {config.optimizer.type}")

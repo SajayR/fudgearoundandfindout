@@ -226,7 +226,7 @@ class DinoV2LoRATrainer:
                     self.config.training.gradient_clip_norm
                 )
             
-            self._reset_fisher_optimizer_state_if_needed()
+            #self._reset_fisher_optimizer_state_if_needed()
             self.optimizer.step()
             #if self.global_step % 20 == 0:
                 #for m in self.model.modules():
@@ -331,6 +331,8 @@ class DinoV2LoRATrainer:
             wandb.log(metrics, step=self.global_step)
 
     def _reset_fisher_optimizer_state_if_needed(self) -> None:
+        module.just_reparam = False
+        return #TODO: check later
         if not hasattr(self.model, "fisher_lora_modules"):
             return
         if self.optimizer is None:
@@ -338,6 +340,7 @@ class DinoV2LoRATrainer:
         for module in self.model.fisher_lora_modules.values():
             if not getattr(module, "just_reparam", False):
                 continue
+            #if getattr(module, "_last_adapter_jump", 0.0) > 1e-6:
             for param in (module.U, module.V):
                 if param is None:
                     continue
@@ -466,6 +469,9 @@ def main():
     
     # Create trainer and start training
     trainer = DinoV2LoRATrainer(config)
+    # HOT PATCH: disable Adam resets on reparam
+    #DinoV2LoRATrainer._reset_fisher_optimizer_state_if_needed = lambda self: None
+
     trainer.train()
 
 
