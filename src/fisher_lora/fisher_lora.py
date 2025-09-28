@@ -18,8 +18,12 @@ class FisherLoRAConfig:
     """Configuration options controlling Fisher-LoRA behavior."""
 
     rank: int
-    ema_decay: float = 0.95
+    ema_decay: float = 0.99
     update_interval: int = 32
+    ema_decay_start: Optional[float] = 0.70
+    ema_decay_anneal_steps: Optional[int] = 500
+    update_interval_start: Optional[int] = 4
+    update_interval_anneal_steps: Optional[int] = 500
     damping: float = 1.0e-5
     min_factor_eig: float = 1.0e-6
     freeze_base: bool = True
@@ -39,8 +43,31 @@ class FisherLoRAConfig:
             raise ValueError("rank must be non-negative")
         if not (0.0 < self.ema_decay < 1.0):
             raise ValueError("ema_decay must be in (0, 1)")
+        if (self.ema_decay_start is None) != (self.ema_decay_anneal_steps is None):
+            raise ValueError("ema_decay_start and ema_decay_anneal_steps must be provided together")
+        if self.ema_decay_start is not None:
+            if not (0.0 < self.ema_decay_start < 1.0):
+                raise ValueError("ema_decay_start must be in (0, 1) when provided")
+        if self.ema_decay_anneal_steps is not None and self.ema_decay_anneal_steps <= 0:
+            raise ValueError("ema_decay_anneal_steps must be positive when provided")
+        if self.ema_decay_start is not None and self.ema_decay_start > self.ema_decay:
+            raise ValueError("ema_decay_start cannot exceed ema_decay")
         if self.update_interval <= 0:
             raise ValueError("update_interval must be positive")
+        if (self.update_interval_start is None) != (self.update_interval_anneal_steps is None):
+            raise ValueError(
+                "update_interval_start and update_interval_anneal_steps must be provided together"
+            )
+        if self.update_interval_start is not None:
+            if self.update_interval_start <= 0:
+                raise ValueError("update_interval_start must be positive when provided")
+        if self.update_interval_anneal_steps is not None and self.update_interval_anneal_steps <= 0:
+            raise ValueError("update_interval_anneal_steps must be positive when provided")
+        if (
+            self.update_interval_start is not None
+            and self.update_interval_start > self.update_interval
+        ):
+            raise ValueError("update_interval_start cannot exceed update_interval")
         if self.damping <= 0.0:
             raise ValueError("damping must be positive")
         if self.min_factor_eig <= 0.0:
@@ -110,10 +137,10 @@ class FisherLoRALinear(nn.Module):
             #u = torch.randn(out_features, self.rank, device=device, dtype=dtype) * init_scale
             #v = torch.randn(in_features, self.rank, device=device, dtype=dtype) * init_scale
             if self.config.use_S:
-                # Small-random U,V; S = 0 → ΔW starts at 0, grads flow to S immediately
                 u = torch.randn(out_features, self.rank, device=device, dtype=dtype) * (1.0 / (out_features ** 0.5))
-                v = torch.randn(in_features,  self.rank, device=device, dtype=dtype) * (1.0 / (in_features  ** 0.5))
-                s = torch.full((self.rank,), fill_value=self.config.s_init_value, device=device, dtype=dtype)
+                v = torch.zeros(in_features,  self.rank, device=device, dtype=dtype)   # keep ΔW=0
+                s0 = self.config.s_init_value if self.config.s_init_value != 0.0 else 1.0  # or alpha/r
+                s = torch.full((self.rank,), fill_value=s0, device=device, dtype=dtype)
             else:
                 # UV-only: LoRA-style safe init (U random, V zero) to keep ΔW=0
                 u = torch.randn(out_features, self.rank, device=device, dtype=dtype) * (1.0 / (out_features ** 0.5))
@@ -214,6 +241,42 @@ class FisherLoRALinear(nn.Module):
 
         output.register_hook(_capture_grad)
 
+    def _current_ema_decay(self, *, step: Optional[int] = None) -> float:
+        cfg = self.config
+        start = cfg.ema_decay_start
+        steps = cfg.ema_decay_anneal_steps
+        end = cfg.ema_decay
+        if start is None or steps is None or steps <= 0:
+            return float(end)
+        if step is None:
+            step = int(self.step_count.item())
+        if step <= 0:
+            return float(start)
+        if step >= steps:
+            return float(end)
+        alpha = step / steps
+        value = start + (end - start) * alpha
+        return float(value)
+
+    def _current_update_interval(self, *, step: Optional[int] = None) -> int:
+        cfg = self.config
+        start = cfg.update_interval_start
+        steps = cfg.update_interval_anneal_steps
+        end = cfg.update_interval
+        if start is None or steps is None or steps <= 0:
+            return int(end)
+        if step is None:
+            step = int(self.step_count.item())
+        if step <= 0:
+            return int(start)
+        if step >= steps:
+            return int(end)
+        alpha = step / steps
+        value = start + (end - start) * alpha
+        value_int = int(round(value))
+        value_int = max(1, value_int)
+        return int(min(end, value_int))
+
     def _update_fisher_stats(self, activations: Tensor, grad_output: Tensor) -> None:
         if self.rank == 0:
             return
@@ -227,14 +290,16 @@ class FisherLoRALinear(nn.Module):
             g_t = g.to(factor_dtype)
             a_factor = torch.matmul(a_t.T, a_t) / a.shape[0]
             g_factor = torch.matmul(g_t.T, g_t) / g.shape[0]
-            decay = self.config.ema_decay
+            pre_step = int(self.step_count.item())
+            decay = self._current_ema_decay(step=pre_step)
             self.A_ema.mul_(decay).add_(a_factor, alpha=1.0 - decay)
             self.B_ema.mul_(decay).add_(g_factor, alpha=1.0 - decay)
             self.step_count.add_(1)
+            step = int(self.step_count.item())
+            current_interval = self._current_update_interval(step=step)
 
             if self.config.track_fisher:
-                log_interval = self.config.whiteness_log_interval or self.config.update_interval
-                step = int(self.step_count.item())
+                log_interval = self.config.whiteness_log_interval or current_interval
                 if step == 1 or (log_interval and step % log_interval == 0):
                     eye_in = torch.eye(
                         self.in_features,
@@ -257,7 +322,7 @@ class FisherLoRALinear(nn.Module):
                             float(e_b),
                         )
                     self._log_whiteness_metrics(float(e_a), float(e_b), phase="pre_refresh")
-            if int(self.step_count.item()) % self.config.update_interval == 0:
+            if step % current_interval == 0:
                 # Defer refresh to next forward pass
                 self.refresh_pending.fill_(True)
 

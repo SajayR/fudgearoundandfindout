@@ -31,7 +31,7 @@ fisher_lora:
   ema_decay: 0.99
   update_interval: 32
   damping: 0.0001
-  min_factor_eig: 0.000001 #doesnt affect training, nan safety shit
+  min_factor_eig: 0.00001 #doesnt affect training, nan safety shit
   freeze_base: true
   train_U: true
   train_V: true
@@ -71,7 +71,7 @@ scheduler:
 logging:
   use_wandb: true
   project_name: "dinov2-imagenet"
-  run_name: bfisher-lora-s-fullpres          # Will be auto-generated if null
+  run_name: bfisher-lora-s-anneal          # Will be auto-generated if null
   log_dir: "./logs"
   
 # Checkpointing
@@ -88,7 +88,7 @@ evaluation:
 
 # Mixed precision training
 mixed_precision:
-  enabled: false
+  enabled: true
   dtype: "bf16"           # Options: fp16, bf16
 
 # Distributed training
