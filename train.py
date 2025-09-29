@@ -227,7 +227,14 @@ class DinoV2LoRATrainer:
             total_norm_before_clip = preclip_other if other_clip else None
             clipped = hit_other if other_clip else None
 
-            self._transport_fisher_optimizer_state_if_needed()
+            if hasattr(self.model, "fisher_lora_modules"):
+                for module in self.model.fisher_lora_modules.values():
+                    if (
+                        isinstance(module, FisherLoRALinear)
+                        and module.rank > 0
+                        and module.config.use_fisher_frame_optim
+                    ):
+                        module.fisher_frame_adamw_step()
             self.optimizer.step()
             #if self.global_step % 20 == 0:
                 #for m in self.model.modules():
@@ -363,25 +370,18 @@ class DinoV2LoRATrainer:
     
     @torch.no_grad()
     def _adapter_adam_effective_scale(self):
-        if not hasattr(self.model, "fisher_lora_modules") or self.optimizer is None:
+        if not hasattr(self.model, "fisher_lora_modules"):
             return None
-        scales = []
+        vals: list[float] = []
         for module in self.model.fisher_lora_modules.values():
-            for param in (getattr(module, "U", None), getattr(module, "V", None), getattr(module, "S", None)):
-                if param is None:
-                    continue
-                state = self.optimizer.state.get(param, None)
-                if not state or ("exp_avg" not in state) or ("exp_avg_sq" not in state):
-                    continue
-                m1 = state["exp_avg"]
-                m2 = state["exp_avg_sq"]
-                eps = 1e-8
-                scale = (m1.abs() / (m2.sqrt() + eps)).mean()
-                if torch.isfinite(scale):
-                    scales.append(float(scale.item()))
-        if not scales:
+            if not isinstance(module, FisherLoRALinear) or module.rank == 0:
+                continue
+            val = module.fisher_eff_scale()
+            if val is not None:
+                vals.append(float(val))
+        if not vals:
             return None
-        return sum(scales) / len(scales)
+        return sum(vals) / len(vals)
 
     def _log_metrics(self, metrics: Dict[str, Any]):
         """Log metrics to wandb."""
@@ -395,9 +395,13 @@ class DinoV2LoRATrainer:
         adapters = []
         if hasattr(self.model, "fisher_lora_modules"):
             for module in self.model.fisher_lora_modules.values():
-                if isinstance(module, FisherLoRALinear):
+                if (
+                    isinstance(module, FisherLoRALinear)
+                    and module.rank > 0
+                    and module.config.use_fisher_frame_optim
+                ):
                     for param in (module.U, module.V, getattr(module, "S", None)):
-                        if param is not None:
+                        if param is not None and param.requires_grad:
                             adapters.append(param)
         return adapters
 
@@ -428,67 +432,6 @@ class DinoV2LoRATrainer:
                     g.mul_(coef)
                 hit = True
         return float(total.item()), hit
-
-    @torch.no_grad()
-    def _transport_fisher_optimizer_state_if_needed(self) -> None:
-        if not hasattr(self.model, "fisher_lora_modules"):
-            return
-        if self.optimizer is None:
-            return
-
-        for module in self.model.fisher_lora_modules.values():
-            if not isinstance(module, FisherLoRALinear):
-                continue
-            if module.rank == 0 or not getattr(module, "just_reparam", False):
-                continue
-            T_B_invT = getattr(module, "_T_B_invT", None)
-            T_A_invT = getattr(module, "_T_A_invT", None)
-            d4_logs: Dict[str, float] = {}
-
-            def _transport_and_check(
-                param: Optional[torch.nn.Parameter],
-                T_invT: Optional[torch.Tensor],
-                tag: str,
-            ) -> None:
-                if param is None or T_invT is None:
-                    return
-                state = self.optimizer.state.get(param, None)
-                if not state:
-                    return
-                m = state.get("exp_avg", None)
-                v = state.get("exp_avg_sq", None)
-                if m is None or v is None:
-                    return
-
-                T = T_invT.to(dtype=m.dtype, device=m.device)
-                H = T * T
-
-                m_old = m.clone()
-                v_old = v.clone()
-
-                m_pred = T @ m_old
-                v_pred = H @ v_old
-
-                num_m = (m_pred - m_old).norm()
-                den_m = m_old.norm() + 1e-12
-                num_v = (v_pred - v_old).norm()
-                den_v = v_old.norm() + 1e-12
-
-                m.copy_(m_pred)
-                v.copy_(v_pred)
-                d4_logs[f'fisher/{tag}_transport_relerr_m'] = float((num_m / den_m).item())
-                d4_logs[f'fisher/{tag}_transport_relerr_v'] = float((num_v / den_v).item())
-
-            _transport_and_check(getattr(module, "U", None), T_B_invT, "U")
-            _transport_and_check(getattr(module, "V", None), T_A_invT, "V")
-
-            if d4_logs:
-                d4_logs['train/step'] = self.global_step
-                self._log_metrics(d4_logs)
-
-            module.just_reparam = False
-            module._T_B_invT = None
-            module._T_A_invT = None
 
     def save_checkpoint(self, metrics: Dict[str, float], is_best: bool = False):
         """Save model checkpoint."""

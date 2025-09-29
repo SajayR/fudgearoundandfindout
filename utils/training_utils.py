@@ -46,6 +46,23 @@ def create_optimizer(model: torch.nn.Module, config) -> torch.optim.Optimizer:
     """Create optimizer based on config."""
     # Get trainable parameters
     trainable_params = [p for p in model.parameters() if p.requires_grad]
+
+    adapter_ids = set()
+    if hasattr(model, "fisher_lora_modules"):
+        try:
+            from fisher_lora import FisherLoRALinear  # type: ignore
+        except Exception:
+            FisherLoRALinear = None
+        if FisherLoRALinear is not None:
+            for module in model.fisher_lora_modules.values():
+                if (
+                    isinstance(module, FisherLoRALinear)
+                    and module.rank > 0
+                    and getattr(module.config, "use_fisher_frame_optim", False)
+                ):
+                    for param in (module.U, module.V, getattr(module, "S", None)):
+                        if param is not None and param.requires_grad:
+                            adapter_ids.add(id(param))
     
     if config.optimizer.type.lower() == "adamw":
         optimizer = optim.AdamW(
@@ -75,7 +92,16 @@ def create_optimizer(model: torch.nn.Module, config) -> torch.optim.Optimizer:
         )
     else:
         raise ValueError(f"Unsupported optimizer type: {config.optimizer.type}")
-    
+
+    if adapter_ids:
+        for group in optimizer.param_groups:
+            if any(id(p) in adapter_ids for p in group['params']):
+                if group.get('weight_decay', 0.0) != 0.0:
+                    logger.warning(
+                        "Resetting weight_decay=0.0 for Fisher-frame adapters to avoid double decay."
+                    )
+                    group['weight_decay'] = 0.0
+
     logger.info(f"Created {config.optimizer.type} optimizer with LR {config.training.learning_rate}")
     return optimizer
 

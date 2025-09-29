@@ -74,7 +74,7 @@ scheduler:
 logging:
   use_wandb: true
   project_name: "dinov2-imagenet"
-  run_name: bfisher-lora-s-anneal-s-oneinit-adamw-transportedmoments-noclipping-fp32adapter        # Will be auto-generated if null
+  run_name: bfisher-lora-fisherframe-optim        # Will be auto-generated if null
   log_dir: "./logs"
   
 # Checkpointing
