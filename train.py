@@ -17,7 +17,6 @@ from torch.utils.data import DataLoader
 from torch.amp import autocast
 import wandb
 from tqdm import tqdm
-from src.fisher_lora import FisherLoRALinear
 
 # Ensure ``src`` directory modules (e.g., fisher_lora) are importable when running as a script
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -26,6 +25,8 @@ if SRC_DIR.exists():
     src_path = str(SRC_DIR)
     if src_path not in sys.path:
         sys.path.insert(0, src_path)
+
+from fisher_lora import FisherLoRALinear
 
 # Local imports
 from data.imagenet_dataset import create_imagenet_dataloaders
@@ -226,7 +227,7 @@ class DinoV2LoRATrainer:
                     self.config.training.gradient_clip_norm
                 )
             
-            #self._reset_fisher_optimizer_state_if_needed()
+            self._transport_fisher_optimizer_state_if_needed()
             self.optimizer.step()
             #if self.global_step % 20 == 0:
                 #for m in self.model.modules():
@@ -330,30 +331,47 @@ class DinoV2LoRATrainer:
         if self.config.logging.use_wandb:
             wandb.log(metrics, step=self.global_step)
 
-    def _reset_fisher_optimizer_state_if_needed(self) -> None:
-        module.just_reparam = False
-        return #TODO: check later
+    @torch.no_grad()
+    def _transport_fisher_optimizer_state_if_needed(self) -> None:
         if not hasattr(self.model, "fisher_lora_modules"):
+            print("no fisher lora modules")
             return
         if self.optimizer is None:
+            print("no optimizer")
             return
+
         for module in self.model.fisher_lora_modules.values():
-            if not getattr(module, "just_reparam", False):
+            if not isinstance(module, FisherLoRALinear):
                 continue
-            #if getattr(module, "_last_adapter_jump", 0.0) > 1e-6:
-            for param in (module.U, module.V):
-                if param is None:
-                    continue
-                state = self.optimizer.state.get(param)
+            if module.rank == 0 or not getattr(module, "just_reparam", False):
+                print("rank 0 or not just reparam")
+                continue
+            print("transporting moments\n"*100)
+            T_B_invT = getattr(module, "_T_B_invT", None)
+            T_A_invT = getattr(module, "_T_A_invT", None)
+
+            def _transport_param(param: Optional[torch.nn.Parameter], T_invT: Optional[torch.Tensor]) -> None:
+                if param is None or T_invT is None:
+                    return
+                state = self.optimizer.state.get(param, None)
                 if not state:
-                    continue
-                exp_avg = state.get("exp_avg")
-                if isinstance(exp_avg, torch.Tensor):
-                    exp_avg.zero_()
-                exp_avg_sq = state.get("exp_avg_sq")
-                if isinstance(exp_avg_sq, torch.Tensor):
-                    exp_avg_sq.zero_()
+                    return
+                m = state.get("exp_avg")
+                v = state.get("exp_avg_sq")
+                if m is None or v is None:
+                    return
+
+                T = T_invT.to(dtype=m.dtype, device=m.device)
+                m.copy_(T @ m)
+                H = T * T
+                v.copy_(H @ v)
+
+            _transport_param(getattr(module, "U", None), T_B_invT)
+            _transport_param(getattr(module, "V", None), T_A_invT)
+
             module.just_reparam = False
+            module._T_B_invT = None
+            module._T_A_invT = None
 
     def save_checkpoint(self, metrics: Dict[str, float], is_best: bool = False):
         """Save model checkpoint."""

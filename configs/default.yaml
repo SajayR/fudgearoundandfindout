@@ -58,7 +58,7 @@ training:
   
 # Optimizer configuration
 optimizer:
-  type: "sgd"           # Options: adamw, adam, sgd
+  type: "adamw"           # Options: adamw, adam, sgd
   betas: [0.9, 0.999]
   eps: 0.00000001
   momentum: 0.9
@@ -73,7 +73,7 @@ scheduler:
 logging:
   use_wandb: true
   project_name: "dinov2-imagenet"
-  run_name: bfisher-lora-s-anneal-s-oneinit-nooptimresets-sgd          # Will be auto-generated if null
+  run_name: bfisher-lora-s-anneal-s-oneinit-adamw-transportedmoments          # Will be auto-generated if null
   log_dir: "./logs"
   
 # Checkpointing

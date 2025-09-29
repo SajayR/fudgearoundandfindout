@@ -30,9 +30,9 @@ class FisherLoRAConfig:
     train_U: bool = True
     train_V: bool = True
 
-    use_S: bool = True                 # enable diagonal S
-    train_S: bool = True               # whether S is trainable
-    s_init_value: float = 0.0          # usually 0.0 for zero adapter at start
+    use_S: bool = True                 
+    train_S: bool = True               
+    s_init_value: float = 0.0          #0.0 might cause grad flow issues
     init_scale: float = 1.0e-3
     factor_dtype: torch.dtype = torch.float32
     track_fisher: bool = True
@@ -177,6 +177,9 @@ class FisherLoRALinear(nn.Module):
         # Set by attach_fisher_lora to identify metrics in logs
         self._fisher_lora_name: Optional[str] = None
         self.just_reparam = False
+        # Transient matrices for transporting optimizer moments after reparameterization
+        self._T_B_invT: Optional[Tensor] = None
+        self._T_A_invT: Optional[Tensor] = None
         self._refresh_whiteners(cache_bases=True)
         self.just_reparam = False
 
@@ -356,6 +359,9 @@ class FisherLoRALinear(nn.Module):
 
     def _refresh_whiteners(self, *, cache_bases: bool) -> None:
         with torch.no_grad():
+            self.just_reparam = False
+            self._T_B_invT = None
+            self._T_A_invT = None
             adapter_jump = None
             U_t: Optional[Tensor] = None
             V_t: Optional[Tensor] = None
@@ -429,7 +435,24 @@ class FisherLoRALinear(nn.Module):
                 new_V = S_A @ V_t
                 self.U.copy_(new_U.to(self.U.dtype))
                 self.V.copy_(new_V.to(self.V.dtype))
-                
+
+                factor_dtype = self.config.factor_dtype
+                I_out = torch.eye(
+                    self.out_features,
+                    dtype=factor_dtype,
+                    device=self.B_ema.device,
+                )
+                I_in = torch.eye(
+                    self.in_features,
+                    dtype=factor_dtype,
+                    device=self.A_ema.device,
+                )
+                T_B_invT = torch.linalg.solve(S_B.T, I_out)
+                T_A_invT = torch.linalg.solve(S_A.T, I_in)
+                self._T_B_invT = T_B_invT
+                self._T_A_invT = T_A_invT
+                self.just_reparam = True
+
             if cache_bases and self.rank > 0:
                 self._cache_l_valid = False
                 self._cache_r_valid = False
