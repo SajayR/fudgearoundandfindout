@@ -37,7 +37,7 @@ class FisherLoRAConfig:
     factor_dtype: torch.dtype = torch.float32
     track_fisher: bool = True
     whiteness_log_interval: Optional[int] = None
-    diagnostics_interval: int = 256
+    diagnostics_interval: int = 1
 
     def __post_init__(self) -> None:
         if not (0.0 <= self.rank):
@@ -229,15 +229,18 @@ class FisherLoRALinear(nn.Module):
             self.refresh_pending.zero_()
 
         L, R = self._skinny_bases()
-        input_2d = input.reshape(-1, self.in_features)
-        proj = torch.matmul(input_2d, R)  # (N, r)
+        with torch.amp.autocast(device_type="cuda", enabled=False):
+            input_2d_f32 = input.reshape(-1, self.in_features).to(torch.float32)
+            L32 = L.to(torch.float32)
+            R32 = R.to(torch.float32)
 
-        # NEW: scale per mode with diagonal S
-        if self.config.use_S:
-            proj = proj * self.S.to(proj.dtype)  # broadcast over batch dim
+            proj32 = input_2d_f32 @ R32              # (N, r)
+            if self.config.use_S and self.S is not None:
+                proj32 = proj32 * self.S.to(torch.float32)  # per-mode scale
 
-        adapter_2d = torch.matmul(proj, L.T)     # (N, dout)
-        adapter = adapter_2d.reshape(*output.shape)
+            adapter_2d32 = proj32 @ L32.T            # (N, d_out)
+
+        adapter = adapter_2d32.to(output.dtype).reshape_as(output)
         result = output + adapter
 
         # ---- D2 numeric range diagnostics (fp32 RMS, cheap) ----
@@ -257,9 +260,7 @@ class FisherLoRALinear(nn.Module):
                 self._last_adapter_rms = float(adapter_2d_32.pow(2).mean().sqrt().item())
         except Exception:
             pass
-        # --------------------------------------------------------
-
-
+       
         if self.training and self.config.track_fisher:
             self._register_fisher_hooks(input, result)
         return result
@@ -413,17 +414,18 @@ class FisherLoRALinear(nn.Module):
                     a_damped = self.A_ema + self.config.damping * eye_in
                     b_damped = self.B_ema + self.config.damping * eye_out
                     e_a, e_b = self._compute_whiteness_errors(a_damped, b_damped, eye_in, eye_out)
-                    if logger.isEnabledFor(logging.INFO):
-                        logger.info(
-                            "Fisher-LoRA whiteness (pre-refresh, step=%d): eA=%.3e eB=%.3e",
-                            step,
-                            float(e_a),
-                            float(e_b),
-                        )
+                    #if logger.isEnabledFor(logging.INFO):
+                        
+                    #    logger.info(
+                    #        "Fisher-LoRA whiteness (pre-refresh, step=%d): eA=%.3e eB=%.3e",
+                    #        step,
+                    #        float(e_a),
+                    #        float(e_b),
+                    #    )
                     self._log_whiteness_metrics(float(e_a), float(e_b), phase="pre_refresh")
             if step % current_interval == 0:
                 # Defer refresh to next forward pass
-                should_refresh = (float(e_a) > 0.25) or (float(e_b) > 0.02)  # RMS thresholds
+                should_refresh = (float(e_a) > 0.025) or (float(e_b) > 0.02)  # RMS thresholds
                 if should_refresh:
                     self.refresh_pending.fill_(True)
 

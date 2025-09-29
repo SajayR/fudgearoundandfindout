@@ -38,6 +38,7 @@ fisher_lora:
   init_scale: 0.001
   factor_dtype: "float32"
   track_fisher: true
+  diagnostics_interval: 1
   whiteness_log_interval: 1  # Set to 1 for per-step pre-refresh logging
   target_modules:
     - "backbone.encoder.layer.*.attention.attention.query"
@@ -73,7 +74,7 @@ scheduler:
 logging:
   use_wandb: true
   project_name: "dinov2-imagenet"
-  run_name: bfisher-lora-s-anneal-s-oneinit-adamw-transportedmoments-diagnostics-noclipping          # Will be auto-generated if null
+  run_name: bfisher-lora-s-anneal-s-oneinit-adamw-transportedmoments-noclipping-fp32adapter        # Will be auto-generated if null
   log_dir: "./logs"
   
 # Checkpointing

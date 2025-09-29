@@ -387,7 +387,7 @@ class DinoV2LoRATrainer:
         """Log metrics to wandb."""
         if not metrics:
             return
-        print(f"[step {self.global_step}] {metrics}")
+        #print(f"[step {self.global_step}] {metrics}")
         if self.config.logging.use_wandb:
             wandb.log(metrics, step=self.global_step)
 
@@ -469,13 +469,13 @@ class DinoV2LoRATrainer:
                 m_pred = T @ m_old
                 v_pred = H @ v_old
 
+                num_m = (m_pred - m_old).norm()
+                den_m = m_old.norm() + 1e-12
+                num_v = (v_pred - v_old).norm()
+                den_v = v_old.norm() + 1e-12
+
                 m.copy_(m_pred)
                 v.copy_(v_pred)
-
-                num_m = (m - m_pred).norm()
-                den_m = m_pred.norm() + 1e-12
-                num_v = (v - v_pred).norm()
-                den_v = v_pred.norm() + 1e-12
                 d4_logs[f'fisher/{tag}_transport_relerr_m'] = float((num_m / den_m).item())
                 d4_logs[f'fisher/{tag}_transport_relerr_v'] = float((num_v / den_v).item())
 
