@@ -174,6 +174,11 @@ class FisherLoRALinear(nn.Module):
                 "R0_cached",
                 torch.zeros(in_features, self.rank, device=device, dtype=dtype),
             )
+            self.register_buffer(
+                "last_refresh_step",
+                torch.zeros((), dtype=torch.long, device=device),
+            )
+
             self._cache_l_valid = False
             self._cache_r_valid = False
         else:
@@ -423,11 +428,40 @@ class FisherLoRALinear(nn.Module):
                     #        float(e_b),
                     #    )
                     self._log_whiteness_metrics(float(e_a), float(e_b), phase="pre_refresh")
-            if step % current_interval == 0:
+            #if step % current_interval == 0:
                 # Defer refresh to next forward pass
-                should_refresh = (float(e_a) > 0.025) or (float(e_b) > 0.02)  # RMS thresholds
+                #should_refresh = (float(e_a) > 0.025) or (float(e_b) > 0.02)  # RMS thresholds
+                #should_refresh = True
+                #if should_refresh:
+                 #   self.refresh_pending.fill_(True)
+                #else:
+                 #   print(f"step {step} eA={float(e_a)} eB={float(e_b)}")
+                 #   print("Should refresh: False")
+            # how many local steps since last refresh for THIS layer
+            elapsed = int(self.step_count.item()) - int(self.last_refresh_step.item())
+            interval = self._current_update_interval(step=step)
+
+            # decide whether we WANT to refresh this layer now
+            # (fix the threshold if you meant 0.25 rather than 0.025)
+            should_refresh = (float(e_a) > 0.05) or (float(e_b) > 0.005)
+
+            if elapsed >= interval:
                 if should_refresh:
                     self.refresh_pending.fill_(True)
+                    self.last_refresh_step.fill_(self.step_count)  # update timestamp
+                    if logger.isEnabledFor(logging.INFO):
+                        logger.info(
+                            "Fisher-LoRA schedule: REFRESH layer=%s step=%d elapsed=%d interval=%d eA=%.3e eB=%.3e",
+                            self._fisher_lora_name or "<?>",
+                            step, elapsed, interval, float(e_a), float(e_b)
+                        )
+                else:
+                    if logger.isEnabledFor(logging.INFO):
+                        logger.info(
+                            "Fisher-LoRA schedule: SKIP layer=%s step=%d elapsed=%d interval=%d eA=%.3e eB=%.3e",
+                            self._fisher_lora_name or "<?>",
+                            step, elapsed, interval, float(e_a), float(e_b)
+                        )
 
     def _skinny_bases(self) -> tuple[Tensor, Tensor]:
         if self.rank == 0:
