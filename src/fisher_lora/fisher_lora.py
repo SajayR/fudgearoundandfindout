@@ -37,6 +37,7 @@ class FisherLoRAConfig:
     factor_dtype: torch.dtype = torch.float32
     track_fisher: bool = True
     whiteness_log_interval: Optional[int] = None
+    diagnostics_interval: int = 256
 
     def __post_init__(self) -> None:
         if not (0.0 <= self.rank):
@@ -78,6 +79,8 @@ class FisherLoRAConfig:
             raise ValueError("rank must be non-negative")
         if self.whiteness_log_interval is not None and self.whiteness_log_interval <= 0:
             raise ValueError("whiteness_log_interval must be positive when provided")
+        if self.diagnostics_interval <= 0:
+            raise ValueError("diagnostics_interval must be positive")
 
 
 class FisherLoRALinear(nn.Module):
@@ -131,6 +134,14 @@ class FisherLoRALinear(nn.Module):
             "refresh_pending",
             torch.zeros((), dtype=torch.bool, device=device),
         )
+        self.register_buffer(
+            "_diag_step_mod",
+            torch.zeros((), dtype=torch.long, device=device),
+        )
+        self._last_proj_rms_preS: Optional[float] = None
+        self._last_proj_rms_postS: Optional[float] = None
+        self._last_adapter_rms: Optional[float] = None
+        self._last_energy_capture: Optional[float] = None
 
         if self.rank > 0:
             init_scale = self.config.init_scale
@@ -177,6 +188,7 @@ class FisherLoRALinear(nn.Module):
         # Set by attach_fisher_lora to identify metrics in logs
         self._fisher_lora_name: Optional[str] = None
         self.just_reparam = False
+        self._last_adapter_jump = 0.0
         # Transient matrices for transporting optimizer moments after reparameterization
         self._T_B_invT: Optional[Tensor] = None
         self._T_A_invT: Optional[Tensor] = None
@@ -228,6 +240,25 @@ class FisherLoRALinear(nn.Module):
         adapter = adapter_2d.reshape(*output.shape)
         result = output + adapter
 
+        # ---- D2 numeric range diagnostics (fp32 RMS, cheap) ----
+        try:
+            with torch.no_grad():
+                input_2d_32 = input_2d.detach().to(torch.float32)
+                R_32 = R.to(torch.float32)
+                proj_preS = input_2d_32 @ R_32
+                if self.config.use_S and self.S is not None:
+                    proj_postS = proj_preS * self.S.to(torch.float32)
+                else:
+                    proj_postS = proj_preS
+                L_32 = L.to(torch.float32)
+                adapter_2d_32 = proj_postS @ L_32.T
+                self._last_proj_rms_preS = float(proj_preS.pow(2).mean().sqrt().item())
+                self._last_proj_rms_postS = float(proj_postS.pow(2).mean().sqrt().item())
+                self._last_adapter_rms = float(adapter_2d_32.pow(2).mean().sqrt().item())
+        except Exception:
+            pass
+        # --------------------------------------------------------
+
 
         if self.training and self.config.track_fisher:
             self._register_fisher_hooks(input, result)
@@ -243,6 +274,56 @@ class FisherLoRALinear(nn.Module):
             return grad_output
 
         output.register_hook(_capture_grad)
+
+    @torch.no_grad()
+    def delta_w_fro_norm(self) -> float:
+        if self.rank == 0:
+            return 0.0
+        L, R = self._skinny_bases()
+        l2 = (L * L).sum(dim=0)
+        r2 = (R * R).sum(dim=0)
+        if self.config.use_S and (self.S is not None):
+            s2 = self.S.to(L.dtype) ** 2
+        else:
+            s2 = torch.ones_like(l2)
+        val2 = (s2 * l2 * r2).sum()
+        return float(val2.sqrt().item())
+
+    @torch.no_grad()
+    def _energy_capture_from_batch(self, a: Tensor, g: Tensor) -> Optional[float]:
+        if self.rank == 0:
+            return None
+        if a.numel() == 0 or g.numel() == 0:
+            return None
+        N = a.shape[0]
+        if N == 0:
+            return None
+        G = (g.T @ a) / float(N)
+        B_inv = self.B_inv_sqrt.to(torch.float32)
+        A_inv = self.A_inv_sqrt.to(torch.float32)
+        Gt = B_inv @ G @ A_inv
+        L, R = self._skinny_bases()
+        L_32 = L.to(torch.float32)
+        R_32 = R.to(torch.float32)
+        try:
+            QL, _ = torch.linalg.qr(L_32, mode="reduced")
+            QR, _ = torch.linalg.qr(R_32, mode="reduced")
+        except RuntimeError:
+            return None
+        M = QL.T @ Gt @ QR
+        num = (M * M).sum()
+        den = (Gt * Gt).sum() + 1e-30
+        return float((num / den).item())
+
+    @torch.no_grad()
+    def get_last_diagnostics(self) -> dict:
+        return {
+            "proj_rms_preS": self._last_proj_rms_preS,
+            "proj_rms_postS": self._last_proj_rms_postS,
+            "adapter_rms": self._last_adapter_rms,
+            "energy_capture": self._last_energy_capture,
+            "deltaW_fro": self.delta_w_fro_norm(),
+        }
 
     def _current_ema_decay(self, *, step: Optional[int] = None) -> float:
         cfg = self.config
@@ -300,6 +381,21 @@ class FisherLoRALinear(nn.Module):
             self.step_count.add_(1)
             step = int(self.step_count.item())
             current_interval = self._current_update_interval(step=step)
+            e_a = torch.zeros((), dtype=factor_dtype, device=self.A_ema.device)
+            e_b = torch.zeros((), dtype=factor_dtype, device=self.B_ema.device)
+
+            # ---- D3: energy capture every diagnostics_interval steps ----
+            self._diag_step_mod.add_(1)
+            diag_interval = int(getattr(self.config, "diagnostics_interval", 256))
+            if diag_interval > 0 and int(self._diag_step_mod.item()) % diag_interval == 0:
+                try:
+                    self._last_energy_capture = self._energy_capture_from_batch(
+                        a.to(torch.float32),
+                        g.to(torch.float32),
+                    )
+                except Exception:
+                    pass
+            # -------------------------------------------------------------
 
             if self.config.track_fisher:
                 log_interval = self.config.whiteness_log_interval or current_interval

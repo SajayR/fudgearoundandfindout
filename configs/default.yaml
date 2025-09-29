@@ -73,7 +73,7 @@ scheduler:
 logging:
   use_wandb: true
   project_name: "dinov2-imagenet"
-  run_name: bfisher-lora-s-anneal-s-oneinit-adamw-transportedmoments          # Will be auto-generated if null
+  run_name: bfisher-lora-s-anneal-s-oneinit-adamw-transportedmoments-diagnostics-noclipping          # Will be auto-generated if null
   log_dir: "./logs"
   
 # Checkpointing
