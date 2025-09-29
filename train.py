@@ -292,6 +292,9 @@ class DinoV2LoRATrainer:
                     'train/other_preclip_norm': preclip_other,
                     'train/other_clip_hit': float(hit_other),
                 }
+                adam_eff = self._adapter_adam_effective_scale()
+                if adam_eff is not None:
+                    metrics['fisher/adam_eff_scale'] = adam_eff
                 metrics = {k: v for k, v in metrics.items() if v is not None}
                 self._log_metrics(metrics)
             
@@ -358,6 +361,28 @@ class DinoV2LoRATrainer:
             'val_top5_accuracy': top5_accuracy
         }
     
+    @torch.no_grad()
+    def _adapter_adam_effective_scale(self):
+        if not hasattr(self.model, "fisher_lora_modules") or self.optimizer is None:
+            return None
+        scales = []
+        for module in self.model.fisher_lora_modules.values():
+            for param in (getattr(module, "U", None), getattr(module, "V", None), getattr(module, "S", None)):
+                if param is None:
+                    continue
+                state = self.optimizer.state.get(param, None)
+                if not state or ("exp_avg" not in state) or ("exp_avg_sq" not in state):
+                    continue
+                m1 = state["exp_avg"]
+                m2 = state["exp_avg_sq"]
+                eps = 1e-8
+                scale = (m1.abs() / (m2.sqrt() + eps)).mean()
+                if torch.isfinite(scale):
+                    scales.append(float(scale.item()))
+        if not scales:
+            return None
+        return sum(scales) / len(scales)
+
     def _log_metrics(self, metrics: Dict[str, Any]):
         """Log metrics to wandb."""
         if not metrics:
