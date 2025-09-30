@@ -12,9 +12,11 @@ from typing import Dict, Any, Optional
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from torch.amp import autocast
+from contextlib import nullcontext
 import wandb
 from tqdm import tqdm
 
@@ -35,106 +37,110 @@ from models.dinov2_fisher_lora import create_dinov2_fisher_lora_model
 from configs.config_manager import ConfigManager, ExperimentConfig
 from utils.metrics import accuracy, top_k_accuracy
 from utils.training_utils import (
-    setup_logging, 
-    save_checkpoint, 
+    setup_logging,
+    save_checkpoint,
     load_checkpoint,
     create_optimizer,
     create_scheduler,
-    set_seed
+    set_seed,
 )
 
 logger = logging.getLogger(__name__)
 import os
+
 os.environ["TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL"] = "1"
+
 
 class DinoV2LoRATrainer:
     """Trainer class for DinoV2 LoRA fine-tuning."""
-    
+
     def __init__(self, config: ExperimentConfig):
         self.config = config
         self.device = self._setup_device()
-        
+
         # Setup directories
         self.checkpoint_dir = Path(config.checkpointing.save_dir)
         self.log_dir = Path(config.logging.log_dir)
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         self.log_dir.mkdir(parents=True, exist_ok=True)
-        
+
         # Initialize components
         self.model = None
         self.optimizer = None
         self.scheduler = None
         self.train_loader = None
         self.val_loader = None
-        
+
         # Training state
         self.current_epoch = 0
         self.global_step = 0
         self.best_metric = 0.0
-        
+
         # Setup logging
         self._setup_logging()
-    
+
     def _setup_device(self) -> torch.device:
         """Setup training device."""
         if self.config.device == "auto":
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         else:
             device = torch.device(self.config.device)
-        
+
         logger.info(f"Using device: {device}")
         if device.type == "cuda":
             logger.info(f"GPU: {torch.cuda.get_device_name()}")
-            logger.info(f"Memory: {torch.cuda.get_device_properties(device).total_memory / 1e9:.1f} GB")
-        
+            logger.info(
+                f"Memory: {torch.cuda.get_device_properties(device).total_memory / 1e9:.1f} GB"
+            )
+
         return device
-    
+
     def _setup_logging(self):
         """Setup experiment logging."""
         if self.config.logging.use_wandb:
             run_name = self.config.logging.run_name
             if run_name is None:
                 run_name = f"dinov2-lora-{int(time.time())}"
-            
+
             wandb.init(
                 project=self.config.logging.project_name,
                 name=run_name,
-                config=self.config.to_dict()
+                config=self.config.to_dict(),
             )
             logger.info(f"Initialized wandb run: {run_name}")
-    
+
     def setup_data(self):
         """Setup data loaders."""
         logger.info("Setting up data loaders...")
-        
+
         self.train_loader, self.val_loader = create_imagenet_dataloaders(
             data_root=self.config.data.dataset_path,
             batch_size=self.config.data.batch_size,
             image_size=self.config.data.image_size,
             num_workers=self.config.data.num_workers,
-            pin_memory=self.config.data.pin_memory
+            pin_memory=self.config.data.pin_memory,
         )
-        
+
         logger.info(f"Train batches: {len(self.train_loader)}")
         logger.info(f"Val batches: {len(self.val_loader)}")
-    
+
     def setup_model(self):
         """Setup model, optimizer, and scheduler."""
         logger.info("Setting up model...")
-        
+
         # Create model
         strategy = getattr(self.config.lora, "strategy", "peft")
         logger.info(f"Adapter strategy: {strategy}")
 
         if strategy == "fisher":
             fisher_cfg = self.config.fisher_lora
-            if hasattr(fisher_cfg, 'to_container'):
+            if hasattr(fisher_cfg, "to_container"):
                 fisher_cfg = fisher_cfg.to_container()
             else:
                 fisher_cfg = dict(fisher_cfg)
 
             target_patterns = fisher_cfg.pop("target_modules", None)
-            if target_patterns is not None and hasattr(target_patterns, 'to_container'):
+            if target_patterns is not None and hasattr(target_patterns, "to_container"):
                 target_patterns = target_patterns.to_container()
             elif target_patterns is not None and not isinstance(target_patterns, list):
                 target_patterns = list(target_patterns)
@@ -152,7 +158,7 @@ class DinoV2LoRATrainer:
         else:
             # Convert target_modules to regular list if it's a ListConfig
             target_modules = self.config.lora.target_modules
-            if hasattr(target_modules, 'to_container'):
+            if hasattr(target_modules, "to_container"):
                 target_modules = target_modules.to_container()
             elif not isinstance(target_modules, list):
                 target_modules = list(target_modules)
@@ -163,44 +169,126 @@ class DinoV2LoRATrainer:
                 lora_r=self.config.lora.r,
                 lora_alpha=self.config.lora.alpha,
                 lora_dropout=self.config.lora.dropout,
-                target_modules=target_modules
+                target_modules=target_modules,
             )
-        
+
         self.model = self.model.to(self.device)
-        
+
         # Print model info
         model_info = get_model_size_info(self.model)
         logger.info(f"Model parameters: {model_info}")
 
         if hasattr(self.model, "fisher_lora_modules"):
-            logger.info(f"Fisher-LoRA adapters active on {len(self.model.fisher_lora_modules)} layers")
-        
+            logger.info(
+                f"Fisher-LoRA adapters active on {len(self.model.fisher_lora_modules)} layers"
+            )
+
         # Create optimizer
         self.optimizer = create_optimizer(self.model, self.config)
-        
+
         # Create scheduler
         total_steps = len(self.train_loader) * self.config.training.epochs
         self.scheduler = create_scheduler(self.optimizer, self.config, total_steps)
-        
+
         logger.info("Model setup complete")
-    
+
+    def calibrate_whiteners(
+        self,
+        max_steps: int = 20000,
+        use_labels: bool = True,
+        T: float = 3.0,
+    ) -> None:
+        """Collect unbiased Fisher factors and freeze whiteners (no optimizer steps)."""
+        if not hasattr(self.model, "fisher_lora_modules") or self.train_loader is None:
+            return
+
+        modules = [
+            m
+            for m in self.model.fisher_lora_modules.values()
+            if isinstance(m, FisherLoRALinear) and m.rank > 0
+        ]
+        if not modules:
+            return
+
+        for module in modules:
+            module.begin_calibration()
+
+        autocast_enabled = (
+            self.config.mixed_precision.enabled and self.device.type == "cuda"
+        )
+        mp_dtype = getattr(self.config.mixed_precision, "dtype", "bf16").lower()
+        amp_dtype = torch.float16 if mp_dtype == "fp16" else torch.bfloat16
+
+        self.model.train()
+        label_loss = nn.CrossEntropyLoss(label_smoothing=0.1)
+        steps = 0
+        data_iter = iter(self.train_loader)
+        progress = tqdm(total=max_steps, desc="Calibrating Fisher", leave=False)
+
+        try:
+            while steps < max_steps:
+                try:
+                    images, targets = next(data_iter)
+                except StopIteration:
+                    data_iter = iter(self.train_loader)
+                    try:
+                        images, targets = next(data_iter)
+                    except StopIteration:
+                        break  # empty loader
+
+                images = images.to(self.device, non_blocking=True)
+
+                amp_context = (
+                    autocast(device_type="cuda", dtype=amp_dtype)
+                    if autocast_enabled
+                    else nullcontext()
+                )
+                with amp_context:
+                    outputs = self.model(images)
+                    if use_labels:
+                        targets = targets.to(self.device, non_blocking=True)
+                        loss = label_loss(outputs, targets)
+                    else:
+                        with torch.no_grad():
+                            teacher = torch.softmax(
+                                outputs.detach().to(torch.float32) / T, dim=-1
+                            )
+                        loss = F.kl_div(
+                            torch.log_softmax(outputs / T, dim=-1),
+                            teacher,
+                            reduction="batchmean",
+                        ) * (T * T)
+
+                self.model.zero_grad(set_to_none=True)
+                loss.backward()
+
+                steps += 1
+                progress.update(1)
+        finally:
+            progress.close()
+
+        for module in modules:
+            module.finalize_calibration(shrink=0.10, damping=1e-4, min_eig=1e-4)
+
+        self.model.zero_grad(set_to_none=True)
+
     def train_epoch(self) -> Dict[str, float]:
         """Train for one epoch."""
         self.model.train()
-        
+
         total_loss = 0.0
         total_samples = 0
         correct_predictions = 0
-        
+
         progress_bar = tqdm(
-            self.train_loader, 
-            desc=f"Epoch {self.current_epoch+1}/{self.config.training.epochs}"
+            self.train_loader,
+            desc=f"Epoch {self.current_epoch + 1}/{self.config.training.epochs}",
         )
-        
+
         for batch_idx, (images, targets) in enumerate(progress_bar):
             images = images.to(self.device, non_blocking=True)
             targets = targets.to(self.device, non_blocking=True)
-            
+
             # Forward pass
             if self.config.mixed_precision.enabled:
                 with autocast(dtype=torch.bfloat16, device_type="cuda"):
@@ -209,7 +297,7 @@ class DinoV2LoRATrainer:
             else:
                 outputs = self.model(images)
                 loss = nn.CrossEntropyLoss()(outputs, targets)
-            
+
             # Backward pass
             self.optimizer.zero_grad()
             loss.backward()
@@ -217,10 +305,16 @@ class DinoV2LoRATrainer:
             adapter_id_set = {id(p) for p in adapter_params}
             other_params = self._collect_other_params(adapter_id_set)
 
-            adapter_clip = None
-            other_clip = self.config.training.gradient_clip_norm if self.config.training.gradient_clip_norm > 0 else None
+            adapter_clip = 64.0  # or None
+            other_clip = (
+                self.config.training.gradient_clip_norm
+                if self.config.training.gradient_clip_norm > 0
+                else None
+            )
 
-            preclip_adapt, hit_adapt = self._clip_group_norm(adapter_params, adapter_clip)
+            preclip_adapt, hit_adapt = self._clip_group_norm(
+                adapter_params, adapter_clip
+            )
             preclip_other, hit_other = self._clip_group_norm(other_params, other_clip)
 
             grad_norm = preclip_other if other_clip else None
@@ -229,31 +323,33 @@ class DinoV2LoRATrainer:
 
             self._transport_fisher_optimizer_state_if_needed()
             self.optimizer.step()
-            #if self.global_step % 20 == 0:
-                #for m in self.model.modules():
-                    #if isinstance(m, FisherLoRALinear): m.balance_columns()
-            
+            # if self.global_step % 20 == 0:
+            # for m in self.model.modules():
+            # if isinstance(m, FisherLoRALinear): m.balance_columns()
+
             if self.scheduler is not None:
                 self.scheduler.step()
-            
+
             # Update metrics
             batch_size = images.size(0)
             total_loss += loss.item() * batch_size
             total_samples += batch_size
-            
+
             # Calculate accuracy
             _, predicted = outputs.max(1)
             correct_predictions += predicted.eq(targets).sum().item()
-            
+
             # Update progress bar
-            current_lr = self.optimizer.param_groups[0]['lr']
-            progress_bar.set_postfix({
-                'loss': f'{loss.item():.4f}',
-                'acc': f'{100.0 * correct_predictions / total_samples:.2f}%',
-                'lr': f'{current_lr:.2e}',
-                'grad_norm': f'{grad_norm:.2e}' if grad_norm is not None else 'N/A'
-            })
-            
+            current_lr = self.optimizer.param_groups[0]["lr"]
+            progress_bar.set_postfix(
+                {
+                    "loss": f"{loss.item():.4f}",
+                    "acc": f"{100.0 * correct_predictions / total_samples:.2f}%",
+                    "lr": f"{current_lr:.2e}",
+                    "grad_norm": f"{grad_norm:.2e}" if grad_norm is not None else "N/A",
+                }
+            )
+
             # Logging
             if self.global_step % self.config.training.logging_steps == 0:
                 diag_list = []
@@ -277,54 +373,55 @@ class DinoV2LoRATrainer:
                 mean_energy = _mean_safe("energy_capture")
 
                 metrics = {
-                    'train/loss': loss.item(),
-                    'train/learning_rate': current_lr,
-                    'train/step': self.global_step,
-                    'fisher/mean_deltaW_fro': mean_deltaW,
-                    'fisher/mean_proj_rms_preS': mean_proj_pre,
-                    'fisher/mean_proj_rms_postS': mean_proj_post,
-                    'fisher/mean_adapter_rms': mean_adapter,
-                    'fisher/mean_energy_capture': mean_energy,
-                    'train/clip_hit': float(bool(clipped)) if clipped is not None else None,
-                    'train/total_norm_preclip': float(total_norm_before_clip) if total_norm_before_clip is not None else None,
-                    'train/adapter_preclip_norm': preclip_adapt,
-                    'train/adapter_clip_hit': float(hit_adapt),
-                    'train/other_preclip_norm': preclip_other,
-                    'train/other_clip_hit': float(hit_other),
+                    "train/loss": loss.item(),
+                    "train/learning_rate": current_lr,
+                    "train/step": self.global_step,
+                    "fisher/mean_deltaW_fro": mean_deltaW,
+                    "fisher/mean_proj_rms_preS": mean_proj_pre,
+                    "fisher/mean_proj_rms_postS": mean_proj_post,
+                    "fisher/mean_adapter_rms": mean_adapter,
+                    "fisher/mean_energy_capture": mean_energy,
+                    "train/clip_hit": float(bool(clipped))
+                    if clipped is not None
+                    else None,
+                    "train/total_norm_preclip": float(total_norm_before_clip)
+                    if total_norm_before_clip is not None
+                    else None,
+                    "train/adapter_preclip_norm": preclip_adapt,
+                    "train/adapter_clip_hit": float(hit_adapt),
+                    "train/other_preclip_norm": preclip_other,
+                    "train/other_clip_hit": float(hit_other),
                 }
                 adam_eff = self._adapter_adam_effective_scale()
                 if adam_eff is not None:
-                    metrics['fisher/adam_eff_scale'] = adam_eff
+                    metrics["fisher/adam_eff_scale"] = adam_eff
                 metrics = {k: v for k, v in metrics.items() if v is not None}
                 self._log_metrics(metrics)
-            
+
             self.global_step += 1
-        
+
         # Epoch metrics
         avg_loss = total_loss / total_samples
         accuracy = 100.0 * correct_predictions / total_samples
-        
-        return {
-            'train_loss': avg_loss,
-            'train_accuracy': accuracy
-        }
-    
+
+        return {"train_loss": avg_loss, "train_accuracy": accuracy}
+
     @torch.no_grad()
     def evaluate(self) -> Dict[str, float]:
         """Evaluate on validation set."""
         self.model.eval()
-        
+
         total_loss = 0.0
         total_samples = 0
         correct_predictions = 0
         top5_correct = 0
-        
+
         progress_bar = tqdm(self.val_loader, desc="Evaluating")
-        
+
         for images, targets in progress_bar:
             images = images.to(self.device, non_blocking=True)
             targets = targets.to(self.device, non_blocking=True)
-            
+
             if self.config.mixed_precision.enabled:
                 with autocast(dtype=torch.bfloat16, device_type="cuda"):
                     outputs = self.model(images)
@@ -332,42 +429,50 @@ class DinoV2LoRATrainer:
             else:
                 outputs = self.model(images)
                 loss = nn.CrossEntropyLoss()(outputs, targets)
-            
+
             batch_size = images.size(0)
             total_loss += loss.item() * batch_size
             total_samples += batch_size
-            
+
             # Top-1 accuracy
             _, predicted = outputs.max(1)
             correct_predictions += predicted.eq(targets).sum().item()
-            
+
             # Top-5 accuracy
             _, top5_pred = outputs.topk(5, 1, True, True)
-            top5_correct += top5_pred.eq(targets.view(-1, 1).expand_as(top5_pred)).sum().item()
-            
+            top5_correct += (
+                top5_pred.eq(targets.view(-1, 1).expand_as(top5_pred)).sum().item()
+            )
+
             # Update progress bar
-            progress_bar.set_postfix({
-                'loss': f'{loss.item():.4f}',
-                'acc': f'{100.0 * correct_predictions / total_samples:.2f}%'
-            })
-        
+            progress_bar.set_postfix(
+                {
+                    "loss": f"{loss.item():.4f}",
+                    "acc": f"{100.0 * correct_predictions / total_samples:.2f}%",
+                }
+            )
+
         avg_loss = total_loss / total_samples
         top1_accuracy = 100.0 * correct_predictions / total_samples
         top5_accuracy = 100.0 * top5_correct / total_samples
-        
+
         return {
-            'val_loss': avg_loss,
-            'val_accuracy': top1_accuracy,
-            'val_top5_accuracy': top5_accuracy
+            "val_loss": avg_loss,
+            "val_accuracy": top1_accuracy,
+            "val_top5_accuracy": top5_accuracy,
         }
-    
+
     @torch.no_grad()
     def _adapter_adam_effective_scale(self):
         if not hasattr(self.model, "fisher_lora_modules") or self.optimizer is None:
             return None
         scales = []
         for module in self.model.fisher_lora_modules.values():
-            for param in (getattr(module, "U", None), getattr(module, "V", None), getattr(module, "S", None)):
+            for param in (
+                getattr(module, "U", None),
+                getattr(module, "V", None),
+                getattr(module, "S", None),
+            ):
                 if param is None:
                     continue
                 state = self.optimizer.state.get(param, None)
@@ -387,7 +492,7 @@ class DinoV2LoRATrainer:
         """Log metrics to wandb."""
         if not metrics:
             return
-        #print(f"[step {self.global_step}] {metrics}")
+        # print(f"[step {self.global_step}] {metrics}")
         if self.config.logging.use_wandb:
             wandb.log(metrics, step=self.global_step)
 
@@ -476,14 +581,18 @@ class DinoV2LoRATrainer:
 
                 m.copy_(m_pred)
                 v.copy_(v_pred)
-                d4_logs[f'fisher/{tag}_transport_relerr_m'] = float((num_m / den_m).item())
-                d4_logs[f'fisher/{tag}_transport_relerr_v'] = float((num_v / den_v).item())
+                d4_logs[f"fisher/{tag}_transport_relerr_m"] = float(
+                    (num_m / den_m).item()
+                )
+                d4_logs[f"fisher/{tag}_transport_relerr_v"] = float(
+                    (num_v / den_v).item()
+                )
 
             _transport_and_check(getattr(module, "U", None), T_B_invT, "U")
             _transport_and_check(getattr(module, "V", None), T_A_invT, "V")
 
             if d4_logs:
-                d4_logs['train/step'] = self.global_step
+                d4_logs["train/step"] = self.global_step
                 self._log_metrics(d4_logs)
 
             module.just_reparam = False
@@ -493,76 +602,96 @@ class DinoV2LoRATrainer:
     def save_checkpoint(self, metrics: Dict[str, float], is_best: bool = False):
         """Save model checkpoint."""
         checkpoint = {
-            'epoch': self.current_epoch,
-            'global_step': self.global_step,
-            'model_state_dict': self.model.state_dict(),
-            'optimizer_state_dict': self.optimizer.state_dict(),
-            'scheduler_state_dict': self.scheduler.state_dict() if self.scheduler else None,
-            'metrics': metrics,
-            'config': self.config.to_dict()
+            "epoch": self.current_epoch,
+            "global_step": self.global_step,
+            "model_state_dict": self.model.state_dict(),
+            "optimizer_state_dict": self.optimizer.state_dict(),
+            "scheduler_state_dict": self.scheduler.state_dict()
+            if self.scheduler
+            else None,
+            "metrics": metrics,
+            "config": self.config.to_dict(),
         }
-        
+
         # Save regular checkpoint
-        checkpoint_path = self.checkpoint_dir / f"checkpoint_epoch_{self.current_epoch}.pt"
+        checkpoint_path = (
+            self.checkpoint_dir / f"checkpoint_epoch_{self.current_epoch}.pt"
+        )
         torch.save(checkpoint, checkpoint_path)
-        
+
         # Save best checkpoint
         if is_best:
             best_path = self.checkpoint_dir / "best_checkpoint.pt"
             torch.save(checkpoint, best_path)
-            logger.info(f"Saved best checkpoint with {self.config.checkpointing.metric_for_best}: {metrics[self.config.checkpointing.metric_for_best]:.4f}")
-        
+            logger.info(
+                f"Saved best checkpoint with {self.config.checkpointing.metric_for_best}: {metrics[self.config.checkpointing.metric_for_best]:.4f}"
+            )
+
         # Save LoRA weights separately
         lora_path = self.checkpoint_dir / f"lora_weights_epoch_{self.current_epoch}"
-        #self.model.save_lora_weights(lora_path) # TODO: add this back in with fisher support
-        
+        # self.model.save_lora_weights(lora_path) # TODO: add this back in with fisher support
+
         logger.info(f"Saved checkpoint: {checkpoint_path}")
-    
+
     def train(self):
         """Main training loop."""
         logger.info("Starting training...")
-        
+
         # Setup
         self.setup_data()
         self.setup_model()
-        
+
+        if (
+            hasattr(self.model, "fisher_lora_modules")
+            and self.model.fisher_lora_modules
+        ):
+            configured_steps = getattr(self.config, "fisher_calibration_steps", None)
+            steps = int(configured_steps) if configured_steps is not None else 20000
+            if steps > 0:
+                logger.info(f"Calibration: {steps} steps")
+                self.calibrate_whiteners(max_steps=steps, use_labels=True, T=3.0)
+
         # Initial evaluation
         if self.config.evaluation.eval_on_start:
             val_metrics = self.evaluate()
             self._log_metrics(val_metrics)
             logger.info(f"Initial evaluation: {val_metrics}")
-        
+
         # Training loop
         for epoch in range(self.config.training.epochs):
             self.current_epoch = epoch
-            
+
             # Train epoch
             train_metrics = self.train_epoch()
-            
+
             # Evaluate
-            if (epoch + 1) % (self.config.training.eval_steps // len(self.train_loader) + 1) == 0:
+            if (epoch + 1) % (
+                self.config.training.eval_steps // len(self.train_loader) + 1
+            ) == 0:
                 val_metrics = self.evaluate()
-                
+
                 # Combine metrics
                 all_metrics = {**train_metrics, **val_metrics}
-                all_metrics['epoch'] = epoch
-                
+                all_metrics["epoch"] = epoch
+
                 # Log metrics
                 self._log_metrics(all_metrics)
-                
+
                 # Check if best model
                 current_metric = val_metrics[self.config.checkpointing.metric_for_best]
                 is_best = current_metric > self.best_metric
                 if is_best:
                     self.best_metric = current_metric
-                
+
                 # Save checkpoint
                 self.save_checkpoint(all_metrics, is_best)
-                
-                logger.info(f"Epoch {epoch+1} - Train: {train_metrics}, Val: {val_metrics}")
-        
+
+                logger.info(
+                    f"Epoch {epoch + 1} - Train: {train_metrics}, Val: {val_metrics}"
+                )
+
         logger.info("Training completed!")
-        
+
         if self.config.logging.use_wandb:
             wandb.finish()
 
@@ -572,9 +701,9 @@ def main():
     parser.add_argument("--config", type=str, default="default", help="Config name")
     parser.add_argument("--experiment-name", type=str, help="Experiment name")
     parser.add_argument("--override", nargs="+", help="Config overrides (key=value)")
-    
+
     args = parser.parse_args()
-    
+
     # Parse overrides
     overrides = {}
     if args.override:
@@ -591,21 +720,21 @@ def main():
             except ValueError:
                 pass  # Keep as string
             overrides[key] = value
-    
+
     # Load config
     config_manager = ConfigManager()
     config = config_manager.load_config(args.config, overrides)
-    
+
     # Set seed for reproducibility
     set_seed(config.seed)
-    
+
     # Setup logging
     setup_logging(config.logging.log_dir)
-    
+
     # Create trainer and start training
     trainer = DinoV2LoRATrainer(config)
     # HOT PATCH: disable Adam resets on reparam
-    #DinoV2LoRATrainer._reset_fisher_optimizer_state_if_needed = lambda self: None
+    # DinoV2LoRATrainer._reset_fisher_optimizer_state_if_needed = lambda self: None
 
     trainer.train()
 

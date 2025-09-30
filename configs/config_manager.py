@@ -138,8 +138,6 @@ class ConfigManager:
             if fisher_cfg is None:
                 raise ValueError("fisher_lora configuration must be provided when using Fisher strategy")
             required_fisher_fields = [
-                "ema_decay",
-                "update_interval",
                 "damping",
                 "min_factor_eig",
                 "freeze_base",
