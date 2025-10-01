@@ -18,7 +18,6 @@ from torch.amp import autocast
 import wandb
 from tqdm import tqdm
 
-
 # Ensure ``src`` directory modules (e.g., fisher_lora) are importable when running as a script
 PROJECT_ROOT = Path(__file__).resolve().parent
 SRC_DIR = PROJECT_ROOT / "src"
@@ -26,6 +25,8 @@ if SRC_DIR.exists():
     src_path = str(SRC_DIR)
     if src_path not in sys.path:
         sys.path.insert(0, src_path)
+
+from fisher_lora import FisherLoRALinear
 
 # Local imports
 from data.imagenet_dataset import create_imagenet_dataloaders
@@ -212,22 +213,25 @@ class DinoV2LoRATrainer:
             # Backward pass
             self.optimizer.zero_grad()
             loss.backward()
-            # Calculate grad norm for logging
-            grad_norm = None
-            if self.config.training.gradient_clip_norm > 0:
-                parameters = [p for p in self.model.parameters() if p.grad is not None]
-                if parameters:
-                    grad_norm = torch.norm(
-                        torch.stack([p.grad.detach().norm(2) for p in parameters]), 2
-                    ).item()
-            if self.config.training.gradient_clip_norm > 0:
-                torch.nn.utils.clip_grad_norm_(
-                    self.model.parameters(), 
-                    self.config.training.gradient_clip_norm
-                )
-            
-            self._reset_fisher_optimizer_state_if_needed()
+            adapter_params = self._collect_adapter_params()
+            adapter_id_set = {id(p) for p in adapter_params}
+            other_params = self._collect_other_params(adapter_id_set)
+
+            adapter_clip = None
+            other_clip = self.config.training.gradient_clip_norm if self.config.training.gradient_clip_norm > 0 else None
+
+            preclip_adapt, hit_adapt = self._clip_group_norm(adapter_params, adapter_clip)
+            preclip_other, hit_other = self._clip_group_norm(other_params, other_clip)
+
+            grad_norm = preclip_other if other_clip else None
+            total_norm_before_clip = preclip_other if other_clip else None
+            clipped = hit_other if other_clip else None
+
+            self._transport_fisher_optimizer_state_if_needed()
             self.optimizer.step()
+            #if self.global_step % 20 == 0:
+                #for m in self.model.modules():
+                    #if isinstance(m, FisherLoRALinear): m.balance_columns()
             
             if self.scheduler is not None:
                 self.scheduler.step()
@@ -252,12 +256,47 @@ class DinoV2LoRATrainer:
             
             # Logging
             if self.global_step % self.config.training.logging_steps == 0:
-                
-                self._log_metrics({
+                diag_list = []
+                if hasattr(self.model, "fisher_lora_modules"):
+                    for name, module in self.model.fisher_lora_modules.items():
+                        if isinstance(module, FisherLoRALinear) and module.rank > 0:
+                            d = module.get_last_diagnostics()
+                            d["layer"] = name
+                            diag_list.append(d)
+
+                def _mean_safe(key: str) -> Optional[float]:
+                    vals = [d[key] for d in diag_list if d.get(key) is not None]
+                    if not vals:
+                        return None
+                    return float(sum(vals) / len(vals))
+
+                mean_deltaW = _mean_safe("deltaW_fro")
+                mean_proj_pre = _mean_safe("proj_rms_preS")
+                mean_proj_post = _mean_safe("proj_rms_postS")
+                mean_adapter = _mean_safe("adapter_rms")
+                mean_energy = _mean_safe("energy_capture")
+
+                metrics = {
                     'train/loss': loss.item(),
                     'train/learning_rate': current_lr,
-                    'train/step': self.global_step
-                })
+                    'train/step': self.global_step,
+                    'fisher/mean_deltaW_fro': mean_deltaW,
+                    'fisher/mean_proj_rms_preS': mean_proj_pre,
+                    'fisher/mean_proj_rms_postS': mean_proj_post,
+                    'fisher/mean_adapter_rms': mean_adapter,
+                    'fisher/mean_energy_capture': mean_energy,
+                    'train/clip_hit': float(bool(clipped)) if clipped is not None else None,
+                    'train/total_norm_preclip': float(total_norm_before_clip) if total_norm_before_clip is not None else None,
+                    'train/adapter_preclip_norm': preclip_adapt,
+                    'train/adapter_clip_hit': float(hit_adapt),
+                    'train/other_preclip_norm': preclip_other,
+                    'train/other_clip_hit': float(hit_other),
+                }
+                adam_eff = self._adapter_adam_effective_scale()
+                if adam_eff is not None:
+                    metrics['fisher/adam_eff_scale'] = adam_eff
+                metrics = {k: v for k, v in metrics.items() if v is not None}
+                self._log_metrics(metrics)
             
             self.global_step += 1
         
@@ -322,32 +361,134 @@ class DinoV2LoRATrainer:
             'val_top5_accuracy': top5_accuracy
         }
     
+    @torch.no_grad()
+    def _adapter_adam_effective_scale(self):
+        if not hasattr(self.model, "fisher_lora_modules") or self.optimizer is None:
+            return None
+        scales = []
+        for module in self.model.fisher_lora_modules.values():
+            for param in (getattr(module, "U", None), getattr(module, "V", None), getattr(module, "S", None)):
+                if param is None:
+                    continue
+                state = self.optimizer.state.get(param, None)
+                if not state or ("exp_avg" not in state) or ("exp_avg_sq" not in state):
+                    continue
+                m1 = state["exp_avg"]
+                m2 = state["exp_avg_sq"]
+                eps = 1e-8
+                scale = (m1.abs() / (m2.sqrt() + eps)).mean()
+                if torch.isfinite(scale):
+                    scales.append(float(scale.item()))
+        if not scales:
+            return None
+        return sum(scales) / len(scales)
+
     def _log_metrics(self, metrics: Dict[str, Any]):
         """Log metrics to wandb."""
+        if not metrics:
+            return
+        #print(f"[step {self.global_step}] {metrics}")
         if self.config.logging.use_wandb:
             wandb.log(metrics, step=self.global_step)
 
-    def _reset_fisher_optimizer_state_if_needed(self) -> None:
+    def _collect_adapter_params(self):
+        adapters = []
+        if hasattr(self.model, "fisher_lora_modules"):
+            for module in self.model.fisher_lora_modules.values():
+                if isinstance(module, FisherLoRALinear):
+                    for param in (module.U, module.V, getattr(module, "S", None)):
+                        if param is not None:
+                            adapters.append(param)
+        return adapters
+
+    def _collect_other_params(self, adapter_set):
+        others = []
+        for param in self.model.parameters():
+            if param.grad is None:
+                continue
+            if id(param) in adapter_set:
+                continue
+            others.append(param)
+        return others
+
+    @staticmethod
+    def _clip_group_norm(params, max_norm: Optional[float]):
+        """Global L2 clip for a subset of params; returns (preclip_norm, hit_flag)."""
+        if not params:
+            return 0.0, False
+        grads = [p.grad.detach() for p in params if p.grad is not None]
+        if not grads:
+            return 0.0, False
+        total = torch.norm(torch.stack([g.norm(2) for g in grads]), 2)
+        hit = False
+        if (max_norm is not None) and (max_norm > 0):
+            coef = float(max_norm) / (total.item() + 1e-12)
+            if coef < 1.0:
+                for g in grads:
+                    g.mul_(coef)
+                hit = True
+        return float(total.item()), hit
+
+    @torch.no_grad()
+    def _transport_fisher_optimizer_state_if_needed(self) -> None:
         if not hasattr(self.model, "fisher_lora_modules"):
             return
         if self.optimizer is None:
             return
+
         for module in self.model.fisher_lora_modules.values():
-            if not getattr(module, "just_reparam", False):
+            if not isinstance(module, FisherLoRALinear):
                 continue
-            for param in (module.U, module.V):
-                if param is None:
-                    continue
-                state = self.optimizer.state.get(param)
+            if module.rank == 0 or not getattr(module, "just_reparam", False):
+                continue
+            T_B_invT = getattr(module, "_T_B_invT", None)
+            T_A_invT = getattr(module, "_T_A_invT", None)
+            d4_logs: Dict[str, float] = {}
+
+            def _transport_and_check(
+                param: Optional[torch.nn.Parameter],
+                T_invT: Optional[torch.Tensor],
+                tag: str,
+            ) -> None:
+                if param is None or T_invT is None:
+                    return
+                state = self.optimizer.state.get(param, None)
                 if not state:
-                    continue
-                exp_avg = state.get("exp_avg")
-                if isinstance(exp_avg, torch.Tensor):
-                    exp_avg.zero_()
-                exp_avg_sq = state.get("exp_avg_sq")
-                if isinstance(exp_avg_sq, torch.Tensor):
-                    exp_avg_sq.zero_()
+                    return
+                m = state.get("exp_avg", None)
+                v = state.get("exp_avg_sq", None)
+                if m is None or v is None:
+                    return
+
+                T = T_invT.to(dtype=m.dtype, device=m.device)
+                H = T * T
+
+                m_old = m.clone()
+                v_old = v.clone()
+
+                m_pred = T @ m_old
+                v_pred = H @ v_old
+
+                num_m = (m_pred - m_old).norm()
+                den_m = m_old.norm() + 1e-12
+                num_v = (v_pred - v_old).norm()
+                den_v = v_old.norm() + 1e-12
+
+                m.copy_(m_pred)
+                v.copy_(v_pred)
+                d4_logs[f'fisher/{tag}_transport_relerr_m'] = float((num_m / den_m).item())
+                d4_logs[f'fisher/{tag}_transport_relerr_v'] = float((num_v / den_v).item())
+
+            _transport_and_check(getattr(module, "U", None), T_B_invT, "U")
+            _transport_and_check(getattr(module, "V", None), T_A_invT, "V")
+
+            if d4_logs:
+                d4_logs['train/step'] = self.global_step
+                self._log_metrics(d4_logs)
+
             module.just_reparam = False
+            module._T_B_invT = None
+            module._T_A_invT = None
 
     def save_checkpoint(self, metrics: Dict[str, float], is_best: bool = False):
         """Save model checkpoint."""
@@ -373,7 +514,7 @@ class DinoV2LoRATrainer:
         
         # Save LoRA weights separately
         lora_path = self.checkpoint_dir / f"lora_weights_epoch_{self.current_epoch}"
-        self.model.save_lora_weights(lora_path)
+        #self.model.save_lora_weights(lora_path) # TODO: add this back in with fisher support
         
         logger.info(f"Saved checkpoint: {checkpoint_path}")
     
@@ -463,6 +604,9 @@ def main():
     
     # Create trainer and start training
     trainer = DinoV2LoRATrainer(config)
+    # HOT PATCH: disable Adam resets on reparam
+    #DinoV2LoRATrainer._reset_fisher_optimizer_state_if_needed = lambda self: None
+
     trainer.train()
 
 
