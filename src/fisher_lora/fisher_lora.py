@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Iterable, Optional
 import logging
+import math
+from typing import Dict, Iterable, Optional
 
 import torch
 from torch import Tensor, nn
@@ -24,6 +25,9 @@ class FisherLoRAConfig:
     ema_decay_anneal_steps: Optional[int] = 1000
     update_interval_start: Optional[int] = 4
     update_interval_anneal_steps: Optional[int] = 1000
+    # Allowed schedule shapes for EMA decay/update interval annealing.
+    ema_decay_schedule: str = "linear"
+    update_interval_schedule: str = "linear"
     damping: float = 1.0e-5
     min_factor_eig: float = 1.0e-6
     freeze_base: bool = True
@@ -78,6 +82,14 @@ class FisherLoRAConfig:
             and self.update_interval_start > self.update_interval
         ):
             raise ValueError("update_interval_start cannot exceed update_interval")
+        if self.ema_decay_schedule not in {"linear", "cosine", "cosine_reverse"}:
+            raise ValueError(
+                "ema_decay_schedule must be one of: linear, cosine, cosine_reverse"
+            )
+        if self.update_interval_schedule not in {"linear", "cosine", "cosine_reverse"}:
+            raise ValueError(
+                "update_interval_schedule must be one of: linear, cosine, cosine_reverse"
+            )
         if self.damping <= 0.0:
             raise ValueError("damping must be positive")
         if self.min_factor_eig <= 0.0:
@@ -363,12 +375,14 @@ class FisherLoRALinear(nn.Module):
             return float(end)
         if step is None:
             step = int(self.step_count.item())
-        if step <= 0:
-            return float(start)
-        if step >= steps:
-            return float(end)
-        alpha = step / steps
-        value = start + (end - start) * alpha
+        alpha = 0.0 if step <= 0 else (1.0 if step >= steps else float(step) / float(steps))
+        mode = cfg.ema_decay_schedule
+        if mode == "linear":
+            value = start + (end - start) * alpha
+        elif mode == "cosine":
+            value = start + 0.5 * (1.0 - math.cos(math.pi * alpha)) * (end - start)
+        else:  # cosine_reverse
+            value = end + 0.5 * (1.0 - math.cos(math.pi * alpha)) * (start - end)
         return float(value)
 
     def _current_update_interval(self, *, step: Optional[int] = None) -> int:
@@ -380,15 +394,17 @@ class FisherLoRALinear(nn.Module):
             return int(end)
         if step is None:
             step = int(self.step_count.item())
-        if step <= 0:
-            return int(start)
-        if step >= steps:
-            return int(end)
-        alpha = step / steps
-        value = start + (end - start) * alpha
-        value_int = int(round(value))
-        value_int = max(1, value_int)
-        return int(min(end, value_int))
+        alpha = 0.0 if step <= 0 else (1.0 if step >= steps else float(step) / float(steps))
+        mode = cfg.update_interval_schedule
+        if mode == "linear":
+            value = start + (end - start) * alpha
+        elif mode == "cosine":
+            value = start + 0.5 * (1.0 - math.cos(math.pi * alpha)) * (end - start)
+        else:  # cosine_reverse
+            value = end + 0.5 * (1.0 - math.cos(math.pi * alpha)) * (start - end)
+        lo, hi = (min(start, end), max(start, end))
+        value = max(lo, min(hi, value))
+        return int(max(1, round(value)))
 
     def _update_fisher_stats(self, activations: Tensor, grad_output: Tensor) -> None:
         if self.rank == 0:

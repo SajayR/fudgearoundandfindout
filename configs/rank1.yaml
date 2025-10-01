@@ -30,6 +30,13 @@ lora:
 fisher_lora:
     ema_decay: 0.99
     update_interval: 1024
+    # anneal EMA decay and refresh cadence with cosine schedule
+    ema_decay_start: 0.8
+    ema_decay_anneal_steps: 4000
+    ema_decay_schedule: "cosine"
+    update_interval_start: 4
+    update_interval_anneal_steps: 4000
+    update_interval_schedule: "cosine"
     damping: 0.0001
     min_factor_eig: 0.001 #doesnt affect training, nan safety shit
     freeze_base: true
