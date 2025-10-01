@@ -51,7 +51,7 @@ def create_optimizer(model: torch.nn.Module, config) -> torch.optim.Optimizer:
         optimizer = optim.AdamW(
             trainable_params,
             lr=config.training.learning_rate,
-            weight_decay=0.001,  # config.training.weight_decay, #hard locked since weight decay is not invariant under reparam
+            weight_decay=0.0,  # config.training.weight_decay, #hard locked since weight decay is not invariant under reparam
             betas=config.optimizer.betas,
             eps=config.optimizer.eps,
         )

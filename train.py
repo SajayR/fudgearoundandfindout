@@ -305,7 +305,7 @@ class DinoV2LoRATrainer:
             adapter_id_set = {id(p) for p in adapter_params}
             other_params = self._collect_other_params(adapter_id_set)
 
-            adapter_clip = 64.0  # or None
+            adapter_clip = 1.0  # or None
             other_clip = (
                 self.config.training.gradient_clip_norm
                 if self.config.training.gradient_clip_norm > 0
